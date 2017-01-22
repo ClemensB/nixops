@@ -1,4 +1,4 @@
-{ system ? builtins.currentSystem, size ? "10" }:
+{ system ? builtins.currentSystem, size ? "10", imageType ? "qcow2", vmwareGuest ? false }:
 let
   pkgs = import <nixpkgs> {};
   config = (import <nixpkgs/nixos/lib/eval-config.nix> {
@@ -13,6 +13,8 @@ let
       services.openssh.enable = true;
       services.openssh.startWhenNeeded = false;
       services.openssh.extraConfig = "UseDNS no";
+
+      services.vmwareGuest.enable = vmwareGuest;
     } ];
   }).config;
 
@@ -23,12 +25,12 @@ in pkgs.vmTools.runInLinuxVM (
         ''
           mkdir $out
           diskImage=$out/image
-          ${pkgs.vmTools.qemu}/bin/qemu-img create -f qcow2 $diskImage "${size}G"
+          ${pkgs.vmTools.qemu}/bin/qemu-img create -f ${imageType} $diskImage "${size}G"
           mv closure xchg/
         '';
       postVM =
         ''
-          mv $diskImage $out/disk.qcow2
+          mv $diskImage $out/disk.${imageType}
         '';
       buildInputs = [ pkgs.utillinux pkgs.perl ];
       exportReferencesGraph =
