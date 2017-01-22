@@ -95,6 +95,8 @@ rec {
           pysqlite
           datadog
           digital-ocean
+          pyvmomi
+          requests2
         ];
 
       # For "nix-build --run-env".
