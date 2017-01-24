@@ -17,7 +17,7 @@ let
   }).config;
 
 in pkgs.vmTools.runInLinuxVM (
-  pkgs.runCommand "libvirtd-image"
+  pkgs.runCommand "generic-image"
     { memSize = 768;
       preVM =
         ''

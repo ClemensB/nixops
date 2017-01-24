@@ -19,12 +19,16 @@ let
           ''
             mkdir $out
             diskImage=$out/image
-            ${pkgs.vmTools.qemu}/bin/qemu-img create -f vmdk -b ${base_image}/disk.vmdk $diskImage
+            ${pkgs.vmTools.qemu}/bin/qemu-img create -f qcow2 -b ${base_image}/disk.vmdk $diskImage
           '';
         buildInputs = [ pkgs.utillinux ];
         postVM =
           ''
-            mv $diskImage $out/disk.qcow2
+            # Convert to VMDK after VM because QEMU can't handle stream-optimized VMDKs
+            ${pkgs.vmTools.qemu}/bin/qemu-img convert -f qcow2 -O vmdk \
+              -o subformat=streamOptimized,compat6 \
+              $diskImage $out/disk.vmdk
+            rm $diskImage
           '';
       }
       ''
