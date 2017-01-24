@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 
 import xml.etree.ElementTree as ET
+import xml.dom.minidom as minidom
+import StringIO
 
 import nixops.util
 from nixops.backends import MachineDefinition, MachineState
@@ -70,7 +72,7 @@ class VirtualSystemBuilder(object):
 
     def add_operating_system_section(self, os_id, os_type):
         operating_system_section = ET.SubElement(self.root, 'OperatingSystemSection')
-        _set_attr_ns(operating_system_section, 'ovf', 'id', os_id)
+        _set_attr_ns(operating_system_section, 'ovf', 'id', str(os_id))
         _set_attr_ns(operating_system_section, 'vmw', 'osType', os_type)
         ET.SubElement(operating_system_section, 'Info').text = 'The kind of installed guest operating system'
 
@@ -109,11 +111,28 @@ class VirtualSystemBuilder(object):
         _sub_element_ns(memory, 'rasd', 'VirtualQuantity').text = str(memory_mb)
         return instance_id
 
+    def add_hardware_sata_controller(self, address):
+        sata_ctrl, instance_id = self._add_virtual_system_setting_data('SATA Controller %d' % address, 20)
+        _sub_element_ns(sata_ctrl, 'rasd', 'Address').text = str(address)
+        _sub_element_ns(sata_ctrl, 'rasd', 'Description').text = 'SATA Controller'
+        _sub_element_ns(sata_ctrl, 'rasd', 'ResourceSubType').text = 'vmware.sata.ahci'
+        return instance_id
+
     def add_hardware_scsi_controller(self, address):
         scsi_ctrl, instance_id = self._add_virtual_system_setting_data('SCSI Controller %d' % address, 6)
         _sub_element_ns(scsi_ctrl, 'rasd', 'Address').text = str(address)
         _sub_element_ns(scsi_ctrl, 'rasd', 'Description').text = 'SCSI Controller'
         _sub_element_ns(scsi_ctrl, 'rasd', 'ResourceSubType').text = 'VirtualSCSI'
+        return instance_id
+
+    def add_hardware_usb_controller(self, address):
+        usb_ctrl, instance_id = self._add_virtual_system_setting_data('USB Controller', 23)
+        _set_attr_ns(usb_ctrl, 'ovf', 'required', 'false')
+        _sub_element_ns(usb_ctrl, 'rasd', 'Address').text = str(address)
+        _sub_element_ns(usb_ctrl, 'rasd', 'Description').text = 'USB Controller (EHCI)'
+        _sub_element_ns(usb_ctrl, 'rasd', 'ResourceSubType').text = 'vmware.usb.ehci'
+        _add_vmw_config(usb_ctrl, 'autoConnectDevices', 'false')
+        _add_vmw_config(usb_ctrl, 'ehciEnabled', 'true')
         return instance_id
 
     def add_hardware_ide_controller(self, address):
@@ -128,7 +147,7 @@ class VirtualSystemBuilder(object):
         _set_attr_ns(video_card, 'ovf', 'required', 'false')
         _sub_element_ns(video_card, 'rasd', 'AutomaticAllocation').text = 'false'
         _add_vmw_config(video_card, 'enable3DSupport', 'true' if enable_3d_support else 'false')
-        _add_vmw_config(video_card, 'enableMPTSupport', 'true' if enable_mpt_support else 'false')
+        _add_vmw_config(video_card, 'enableMPTSupport', 'true' if enable_mpt_support else 'false')  # What's this?
         _add_vmw_config(video_card, 'use3dRenderer', use_3d_renderer)
         _add_vmw_config(video_card, 'useAutoDetect', 'true' if use_auto_detect else 'false')
         _add_vmw_config(video_card, 'videoRamSizeInKB', str(video_ram_size_in_kb))
@@ -191,6 +210,7 @@ class OVFBuilder(object):
     def __init__(self):
         self.root = ET.Element('Envelope')
         self.root.set('xmlns', _namespaces['ovf'])
+        self.tree = ET.ElementTree(self.root)
 
         self.references = ET.SubElement(self.root, 'References')
 
@@ -204,11 +224,11 @@ class OVFBuilder(object):
         file_reference = ET.SubElement(self.references, 'File')
         _set_attr_ns(file_reference, 'ovf', 'href', href)
         _set_attr_ns(file_reference, 'ovf', 'id', reference_id)
-        _set_attr_ns(file_reference, 'ovf', 'size', size)
+        _set_attr_ns(file_reference, 'ovf', 'size', str(size))
 
     def add_disk(self, capacity, capacity_allocation_units, disk_id, file_ref, disk_format):
         disk = ET.SubElement(self.disk_section, 'Disk')
-        _set_attr_ns(disk, 'ovf', 'capacity', capacity)
+        _set_attr_ns(disk, 'ovf', 'capacity', str(capacity))
         _set_attr_ns(disk, 'ovf', 'capacityAllocationUnits', capacity_allocation_units)
         _set_attr_ns(disk, 'ovf', 'diskId', disk_id)
         _set_attr_ns(disk, 'ovf', 'fileRef', file_ref)
@@ -227,7 +247,46 @@ class OVFBuilder(object):
         return VirtualSystemBuilder(virtual_system)
 
     def get_xml(self):
-        return ET.dump(self.root)
+        # Sort rasd:* elements because that's required by definition
+        for vm in self.root.findall('VirtualSystem'):
+            for item in vm.find('VirtualHardwareSection').findall('Item'):
+                item[:] = sorted(item, key=lambda child: child.tag)
+
+        xml_file = StringIO.StringIO()
+        self.tree.write(xml_file, encoding="utf-8", xml_declaration=True)
+        xml_str = xml_file.getvalue()
+        xml_file.close()
+
+        # Pretty print OVF XML
+        return minidom.parseString(xml_str).toprettyxml(indent='    ')
+
+
+def generate_simple_ovf(name, num_vcpus, memory_mb, disk_capacity_mb, networks):
+    ovf = OVFBuilder()
+
+    ovf.add_file_reference('disk-1.vmdk', 'file1', 0)
+    ovf.add_disk(disk_capacity_mb, 'byte * 2^20', 'vmdisk1', 'file1',
+                 'http://www.vmware.com/interfaces/specifications/vmdk.html#streamOptimized')
+
+    for network in networks:
+        ovf.add_network(network)
+
+    system = ovf.add_virtual_system(name)
+    system.add_operating_system_section(100, 'other3xLinux64Guest')
+    system.add_hardware_system(name, 'vmx-11')
+    system.add_hardware_vcpus(num_vcpus)
+    system.add_hardware_memory(memory_mb)
+    scsi_ctrl = system.add_hardware_scsi_controller(0)
+    system.add_hardware_video_card(False, False, 'automatic', False, 4096)
+    system.add_hardware_vmci_device(False)
+    system.add_hardware_hard_disk(scsi_ctrl, 0, 'ovf:/disk/vmdisk1', False)
+
+    nic_address_on_parent = 7  # For some reason it starts with 7
+    for network in networks:
+        system.add_hardware_ethernet(nic_address_on_parent, network, 'VmxNet3', True)
+        nic_address_on_parent += 1
+
+    return ovf.get_xml()
 
 
 class VSphereDefinition(MachineDefinition):
@@ -242,8 +301,8 @@ class VSphereDefinition(MachineDefinition):
 
 
 class VSphereState(MachineState):
-    client_public_key = nixops.util.attr_property("libvirtd.clientPublicKey", None)
-    client_private_key = nixops.util.attr_property("libvirtd.clientPrivateKey", None)
+    client_public_key = nixops.util.attr_property("vsphere.clientPublicKey", None)
+    client_private_key = nixops.util.attr_property("vsphere.clientPrivateKey", None)
 
     @classmethod
     def get_type(cls):
@@ -251,3 +310,6 @@ class VSphereState(MachineState):
 
     def create(self, defn, check, allow_reboot, allow_recreate):
         assert isinstance(defn, VSphereDefinition)
+
+    def destroy(self, wipe=False):
+        return True
