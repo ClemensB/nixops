@@ -13,7 +13,7 @@ let
       services.openssh.enable = true;
       services.openssh.startWhenNeeded = false;
       services.openssh.extraConfig = "UseDNS no";
-    } // extraConfig ];
+    } extraConfig ];
   }).config;
 
 in pkgs.vmTools.runInLinuxVM (
