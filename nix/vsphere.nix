@@ -4,7 +4,13 @@ with lib;
 
 let
   sz = toString config.deployment.vsphere.baseImageSize;
-  base_image = import ./libvirtd-image.nix { size = sz; imageType = "vmdk"; vmwareGuest = true; };
+  base_image = import ./generic-image.nix {
+    size = sz;
+    extraConfig = {
+      boot.initrd.availableKernelModules = [ "vmw_pvscsi" ];
+      services.vmwareGuest.enable = true;
+    };
+  };
   the_key = builtins.getEnv "NIXOPS_VSPHERE_PUBKEY";
   ssh_image = pkgs.vmTools.runInLinuxVM (
     pkgs.runCommand "vsphere-ssh-image"
