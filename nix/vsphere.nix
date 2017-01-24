@@ -159,9 +159,13 @@ in
     boot.loader.grub.device = "/dev/sda";
     boot.loader.timeout = 0;
 
+    boot.initrd.availableKernelModules = [ "vmw_pvscsi" ];
+
     services.openssh.enable = true;
     services.openssh.startWhenNeeded = false;
     services.openssh.extraConfig = "UseDNS no";
+
+    services.vmwareGuest.enable = true;
 
     deployment.hasFastConnection = true;
 };
