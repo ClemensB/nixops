@@ -2,7 +2,7 @@
   pkgs ? import <nixpkgs> {},
   system ? builtins.currentSystem,
   size ? "10",
-  root_ssh_authorized_key
+  authorizedSSHKeys
 }:
 let
   base_image = import ./generic-image.nix {
@@ -42,7 +42,7 @@ pkgs.vmTools.runInLinuxVM (
     mount /dev/vda1 /mnt
 
     mkdir -p /mnt/etc/ssh/authorized_keys.d
-    echo '${root_ssh_authorized_key}' > /mnt/etc/ssh/authorized_keys.d/root
+    echo '${authorizedSSHKeys}' > /mnt/etc/ssh/authorized_keys.d/root
     umount /mnt
   ''
 )
