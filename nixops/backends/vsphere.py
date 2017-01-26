@@ -1,9 +1,17 @@
 # -*- coding: utf-8 -*-
-
+import atexit
+import os
 import xml.etree.ElementTree as ET
 import xml.dom.minidom as minidom
 import StringIO
+import time
 
+import requests
+
+from pyVim import connect
+from pyVmomi import vim
+
+import nixops.known_hosts
 import nixops.util
 from nixops.backends import MachineDefinition, MachineState
 
@@ -300,16 +308,250 @@ class VSphereDefinition(MachineDefinition):
         MachineDefinition.__init__(self, xml, config)
 
 
+class ReadFileMonitor(file):
+    def __init__(self, name, mode='r', buffering=-1, callback=None, *args):
+        super(ReadFileMonitor, self).__init__(name, mode, buffering)
+        self.seek(0, os.SEEK_END)
+        self._length = self.tell()
+        self.seek(0)
+        self._callback = callback
+        self._args = args
+
+    def __len__(self):
+        return self._length
+
+    def read(self, size=-1):
+        data = super(ReadFileMonitor, self).read(size)
+        self._callback(self._length, self.tell(), *self._args)
+        return data
+
+
 class VSphereState(MachineState):
     client_public_key = nixops.util.attr_property("vsphere.clientPublicKey", None)
     client_private_key = nixops.util.attr_property("vsphere.clientPrivateKey", None)
+
+    host_public_key = nixops.util.attr_property("vsphere.hostPublicKey", None)
+    host_private_key = nixops.util.attr_property("vsphere.hostPrivateKey", None)
+
+    # vSphere credentials
+    vsphere_host = nixops.util.attr_property("vsphere.host", None)
+    vsphere_port = nixops.util.attr_property("vsphere.port", None, int)
+    vsphere_user = nixops.util.attr_property("vsphere.user", None)
+    vsphere_password = nixops.util.attr_property("vsphere.password", None)
+
+    ip_address = nixops.util.attr_property("vsphere.ipAddress", None)
+
+    @property
+    def private_ipv4(self):
+        return self.ip_address
+
+    @property
+    def public_host_key(self):
+        return self.host_public_key
+
+    @property
+    def resource_id(self):
+        return self.vm_id
 
     @classmethod
     def get_type(cls):
         return "vsphere"
 
+    def __init__(self, depl, name, id):
+        MachineState.__init__(self, depl, name, id)
+        self.service_instance = None
+
+    def _get_service_instance(self):
+        if self.service_instance is not None:
+            return self.service_instance
+
+        assert self.vsphere_user and self.vsphere_password
+        self.service_instance = connect.SmartConnect(host=self.vsphere_host, port=self.vsphere_port,
+                                                     user=self.vsphere_user,
+                                                     pwd=self.vsphere_password)
+        atexit.register(connect.Disconnect, self.service_instance)
+        return self.service_instance
+
+    @staticmethod
+    def _get_obj_in_list(obj_name, obj_list):
+        for o in obj_list:
+            if o.name == obj_name:
+                return o
+        return None
+
+    @staticmethod
+    def _get_obj_in_list_or_first(obj_name, obj_list):
+        if obj_name is not None:
+            return VSphereState._get_obj_in_list(obj_name, obj_list)
+        elif len(obj_list) > 0:
+            return obj_list[0]
+        else:
+            return None
+
+    def _get_machine(self):
+        service_instance = self._get_service_instance()
+        content = service_instance.RetrieveContent()
+        machines = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True).view
+        return self._get_obj_in_list(self.vm_id, machines)
+
+    def _get_datacenter(self, dc_name):
+        service_instance = self._get_service_instance()
+        datacenters = service_instance.content.rootFolder.childEntity
+        return self._get_obj_in_list_or_first(dc_name, datacenters)
+
+    def _get_datastore(self, datacenter, ds_name):
+        datastores = datacenter.datastoreFolder.childEntity
+        return self._get_obj_in_list_or_first(ds_name, datastores)
+
+    def _get_cluster(self, datacenter, cluster_name):
+        clusters = datacenter.hostFolder.childEntity
+        return self._get_obj_in_list_or_first(cluster_name, clusters)
+
     def create(self, defn, check, allow_reboot, allow_recreate):
         assert isinstance(defn, VSphereDefinition)
 
+        self.set_common_state(defn)
+        self.vsphere_host = defn.config['vsphere']['host']
+        self.vsphere_port = defn.config['vsphere']['port']
+        self.vsphere_user = defn.config['vsphere']['user']
+        self.vsphere_password = defn.config['vsphere']['password']
+
+        if not self.vm_id:
+            self.vm_id = "nixops-{0}-{1}".format(self.depl.uuid, self.name)
+
+        if not self.host_public_key:
+            (self.host_private_key, self.host_public_key) = nixops.util.create_key_pair()
+
+        if not self.client_public_key:
+            (self.client_private_key, self.client_public_key) = nixops.util.create_key_pair()
+
+        machine = self._get_machine()
+        if machine is None:
+            base_image_size = defn.config['vsphere']['baseImageSize']
+            base_image = self._logged_exec(
+                ["nix-build", "{0}/vsphere-image.nix".format(self.depl.expr_path),
+                 "--arg", "size", '"{0}"'.format(base_image_size),
+                 "--arg", "authorizedSSHKeys", '"{0}"'.format(self.client_public_key),
+                 "--arg", "sshHostKeyPrivate", '"{0}"'.format(self.host_private_key),
+                 "--arg", "sshHostKeyPublic", '"{0}"'.format(self.host_public_key)],
+                capture_stdout=True).rstrip()
+            base_image += '/disk.vmdk'
+
+            ovf = generate_simple_ovf(self.vm_id, defn.config['vsphere']['vcpu'], defn.config['vsphere']['memorySize'],
+                                      base_image_size * 1024, defn.config['vsphere']['networks'])
+
+            datacenter = self._get_datacenter(defn.config['vsphere']['datacenter'])
+            assert datacenter is not None
+            datastore = self._get_datastore(datacenter, defn.config['vsphere']['datastore'])
+            assert datastore is not None
+            cluster = self._get_cluster(datacenter, defn.config['vsphere']['cluster'])
+            assert cluster is not None
+
+            resource_pool = cluster.resourcePool
+
+            manager = self._get_service_instance().content.ovfManager
+            spec_params = vim.OvfManager.CreateImportSpecParams()
+            import_spec = manager.CreateImportSpec(ovf, resource_pool, datastore, spec_params)
+
+            self.log('importing virtual machine...')
+            lease = resource_pool.ImportVApp(import_spec.importSpec, datacenter.vmFolder)
+
+            while lease.state == vim.HttpNfcLease.State.initializing:
+                time.sleep(0.1)
+
+            if lease.state != vim.HttpNfcLease.State.ready:
+                self.log('initialization of virtual machine failed')
+                return False
+
+            # Transfer VMDK
+            disk_url = lease.info.deviceUrl[0].url.replace('*', self.vsphere_host)
+
+            progress = [0]
+
+            def upload_progress(total_size, uploaded_size):
+                new_progress = int(float(uploaded_size) / total_size)
+                if new_progress > progress[0]:
+                    lease.HttpNfcLeaseProgress(new_progress)
+                    progress[0] = new_progress
+
+            self.log('uploading VMDK...')
+            with ReadFileMonitor(base_image, 'rb', callback=upload_progress) as f:
+                # FIXME: Why doesn't requests accept the certificate?
+                requests.post(disk_url, data=f, verify=False)
+
+            lease.HttpNfcLeaseComplete()
+
+            if lease.state != vim.HttpNfcLease.State.done:
+                self.log('provisioning of virtual machine failed')
+                return False
+
+        self.start()
+        return True
+
+    def _update_ip(self):
+        machine = self._get_machine()
+        assert machine
+
+        new_address = machine.guest.ipAddress
+        nixops.known_hosts.update(self.private_ipv4, new_address, self.public_host_key)
+        self.ip_address = new_address
+
+    def _wait_for_ip(self):
+        self.log_start('waiting for IP address...')
+        while True:
+            self._update_ip()
+            if self.ip_address is not None:
+                break
+            time.sleep(1)
+            self.log_continue('.')
+        self.log_end(' ' + self.ip_address)
+
+    def start(self):
+        machine = self._get_machine()
+        assert machine
+
+        if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            return
+
+        self.log('starting machine...')
+        machine.PowerOn()
+
+        self._wait_for_ip()
+        self.wait_for_ssh(check=True)
+
+    def stop(self):
+        machine = self._get_machine()
+        assert machine
+
+        if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            self.log_start('shutting down...')
+
+            self.run_command('systemctl poweroff', check=False)
+
+            while machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+                self.log_continue('.')
+                time.sleep(1)
+
+            self.log_end('')
+
+    def get_ssh_name(self):
+        assert self.ip_address
+        return self.ip_address
+
+    def get_ssh_private_key_file(self):
+        return self._ssh_private_key_file or self.write_ssh_private_key(self.client_private_key)
+
+    def get_ssh_flags(self, *args, **kwargs):
+        super_flags = super(VSphereState, self).get_ssh_flags(*args, **kwargs)
+        return super_flags + ["-i", self.get_ssh_private_key_file()]
+
     def destroy(self, wipe=False):
+        machine = self._get_machine()
+
+        if machine:
+            if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+                self.stop()
+
+            machine.Destroy()
+
         return True

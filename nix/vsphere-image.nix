@@ -2,7 +2,9 @@
   pkgs ? import <nixpkgs> {},
   system ? builtins.currentSystem,
   size ? "10",
-  authorizedSSHKeys
+  authorizedSSHKeys,
+  sshHostKeyPrivate,
+  sshHostKeyPublic
 }:
 let
   base_image = import ./generic-image.nix {
@@ -43,6 +45,9 @@ pkgs.vmTools.runInLinuxVM (
 
     mkdir -p /mnt/etc/ssh/authorized_keys.d
     echo '${authorizedSSHKeys}' > /mnt/etc/ssh/authorized_keys.d/root
+    echo '${sshHostKeyPrivate}' > /mnt/etc/ssh/ssh_host_ed25519_key
+    chmod 0600 /mnt/etc/ssh/ssh_host_ed25519_key
+    echo '${sshHostKeyPublic}' > /mnt/etc/ssh/ssh_host_ed25519_key.pub
     umount /mnt
   ''
 )

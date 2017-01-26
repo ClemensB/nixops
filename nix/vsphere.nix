@@ -80,6 +80,15 @@ with lib;
       '';
     };
 
+    deployment.vsphere.baseImageSize = mkOption {
+      default = 10;
+      type = types.int;
+      description = ''
+        The size (G) of base image of virtual machine.
+      '';
+    };
+
+
     deployment.vsphere.networks = mkOption {
       type = types.listOf types.str;
       description = "Names of port groups to attach the VM to.";
