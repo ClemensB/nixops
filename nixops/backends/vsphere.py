@@ -469,7 +469,7 @@ class VSphereState(MachineState):
             progress = [0]
 
             def upload_progress(total_size, uploaded_size):
-                new_progress = int(float(uploaded_size) / total_size)
+                new_progress = int(float(uploaded_size) / total_size * 100.0)
                 if new_progress > progress[0]:
                     lease.HttpNfcLeaseProgress(new_progress)
                     progress[0] = new_progress
