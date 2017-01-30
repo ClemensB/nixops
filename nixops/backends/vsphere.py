@@ -430,11 +430,7 @@ class VSphereState(MachineState):
             base_image_size = defn.config['vsphere']['baseImageSize']
             base_image = self._logged_exec(
                 ["nix-build", "{0}/vsphere-image.nix".format(self.depl.expr_path),
-                 "--arg", "size", '"{0}"'.format(base_image_size),
-                 "--arg", "authorizedSSHKeys", '"{0}"'.format(self.client_public_key),
-                 "--arg", "sshHostKeyPrivate", '"{0}"'.format(self.host_private_key),
-                 "--arg", "sshHostKeyPublic", '"{0}"'.format(self.host_public_key)],
-                capture_stdout=True).rstrip()
+                 "--arg", "size", '"{0}"'.format(base_image_size)], capture_stdout=True).rstrip()
             base_image += '/disk.vmdk'
 
             ovf = generate_simple_ovf(self.vm_id, defn.config['vsphere']['vcpu'], defn.config['vsphere']['memorySize'],
@@ -484,6 +480,30 @@ class VSphereState(MachineState):
             if lease.state != vim.HttpNfcLease.State.done:
                 self.log('provisioning of virtual machine failed')
                 return False
+
+            machine = self._get_machine()
+            assert machine
+
+            guest_config_spec = vim.VirtualMachineConfigSpec()
+            guest_config_spec.extraConfig.append(
+                vim.option.OptionValue(key='guestinfo.sshPrivateHostKey', value=self.host_private_key))
+            guest_config_spec.extraConfig.append(
+                vim.option.OptionValue(key='guestinfo.sshPublicHostKey', value=self.host_public_key))
+            guest_config_spec.extraConfig.append(
+                vim.option.OptionValue(key='guestinfo.sshAuthorizedKeys', value=self.client_public_key))
+
+            self.log_start('configuring VM...')
+            reconfig_task = machine.ReconfigVM_Task(guest_config_spec)
+            while reconfig_task.info.state == vim.TaskInfoState.running \
+                    or reconfig_task.info.state == vim.TaskInfoState.queued:
+                self.log_continue('.')
+                time.sleep(0.1)
+
+            if reconfig_task.info.state == vim.TaskInfoState.error:
+                self.log_end(' FAILED')
+                return False
+
+            self.log_end('')
 
         self.start()
         return True
