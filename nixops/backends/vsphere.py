@@ -425,8 +425,10 @@ class VSphereState(MachineState):
         if not self.client_public_key:
             (self.client_private_key, self.client_public_key) = nixops.util.create_key_pair()
 
-        machine = self._get_machine()
-        if machine is None:
+        if check:
+            self.check()
+
+        if self.state == self.MISSING:
             base_image_size = defn.config['vsphere']['baseImageSize']
             base_image = self._logged_exec(
                 ["nix-build", "{0}/vsphere-image.nix".format(self.depl.expr_path),
@@ -504,8 +506,11 @@ class VSphereState(MachineState):
                 return False
 
             self.log_end('')
+            self.state = self.STOPPED
 
-        self.start()
+        if self.state == self.STOPPED:
+            self.start()
+
         return True
 
     def _update_ip(self):
@@ -527,32 +532,40 @@ class VSphereState(MachineState):
         self.log_end(' ' + self.ip_address)
 
     def start(self):
+        if self.state != self.STOPPED:
+            self.logger.warn("Machine must be in state STOPPED to be started")
+            return
+
         machine = self._get_machine()
         assert machine
-
-        if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
-            return
 
         self.log('starting machine...')
         machine.PowerOn()
+        self.state = self.STARTING
 
         self._wait_for_ip()
-        self.wait_for_ssh(check=True)
+        self.wait_for_ssh(check=True)  # wait_for_ssh will update state for us
 
     def stop(self):
+        if self.state != self.UP:
+            self.logger.warn("Machine must be in state UP to be stopped")
+            return
+
         machine = self._get_machine()
         assert machine
 
-        if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
-            self.log_start('shutting down...')
+        self.log_start('shutting down...')
+        self.state = self.STOPPING
 
-            self.run_command('systemctl poweroff', check=False)
+        # FIXME: Maybe use the vSphere API when the open-vm-tools are fixed (they currently try to use /sbin/shutdown)
+        self.run_command('systemctl poweroff', check=False)
 
-            while machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
-                self.log_continue('.')
-                time.sleep(1)
+        while machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
+            self.log_continue('.')
+            time.sleep(1)
 
-            self.log_end('')
+        self.log_end('')
+        self.state = self.STOPPED
 
     def get_ssh_name(self):
         assert self.ip_address
@@ -576,5 +589,25 @@ class VSphereState(MachineState):
                 self.stop()
 
             machine.Destroy()
+            self.state = self.MISSING
 
         return True
+
+    def _check(self, res):
+        machine = self._get_machine()
+
+        res.exists = machine is not None
+
+        if not res.exists:
+            self.state = self.MISSING
+            self.ip_address = None  # This can no longer be valid
+            return
+
+        res.is_up = machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn
+
+        if not res.is_up:
+            self.state = self.STOPPED
+            return
+
+        # The machine exists and is up, the default implementation can check the rest
+        super(VSphereState, self)._check(res)
