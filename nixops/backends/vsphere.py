@@ -425,8 +425,12 @@ class VSphereState(MachineState):
         if not self.client_public_key:
             (self.client_private_key, self.client_public_key) = nixops.util.create_key_pair()
 
-        if check:
+        if self.state == self.UNKNOWN or check:
             self.check()
+
+        if self.state not in [self.MISSING, self.STOPPED, self.UP]:
+            self.logger.warn('Machine must be in states MISSING, STOPPED or UP to be created/updated')
+            return False
 
         if self.state == self.MISSING:
             self.logger.log('Building VM specification and base image...')
@@ -595,7 +599,6 @@ class VSphereState(MachineState):
                 self.stop()
 
             machine.Destroy()
-            self.state = self.MISSING
 
         return True
 
