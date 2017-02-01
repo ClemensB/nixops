@@ -429,6 +429,8 @@ class VSphereState(MachineState):
             self.check()
 
         if self.state == self.MISSING:
+            self.logger.log('Building VM specification and base image...')
+
             base_image_size = defn.config['vsphere']['baseImageSize']
             base_image = self._logged_exec(
                 ["nix-build", "{0}/vsphere-image.nix".format(self.depl.expr_path),
@@ -451,14 +453,14 @@ class VSphereState(MachineState):
             spec_params = vim.OvfManager.CreateImportSpecParams()
             import_spec = manager.CreateImportSpec(ovf, resource_pool, datastore, spec_params)
 
-            self.log('importing virtual machine...')
+            self.logger.log('Importing virtual machine to vSphere...')
             lease = resource_pool.ImportVApp(import_spec.importSpec, datacenter.vmFolder)
 
             while lease.state == vim.HttpNfcLease.State.initializing:
                 time.sleep(0.1)
 
             if lease.state != vim.HttpNfcLease.State.ready:
-                self.log('initialization of virtual machine failed')
+                self.logger.warn('Initialization of virtual machine failed')
                 return False
 
             # Transfer VMDK
@@ -472,15 +474,20 @@ class VSphereState(MachineState):
                     lease.HttpNfcLeaseProgress(new_progress)
                     progress[0] = new_progress
 
-            self.log('uploading VMDK...')
-            with ReadFileMonitor(base_image, 'rb', callback=upload_progress) as f:
-                # FIXME: Why doesn't requests accept the certificate?
-                requests.post(disk_url, data=f, verify=False)
+            self.logger.log('Uploading base image...')
+            try:
+                with ReadFileMonitor(base_image, 'rb', callback=upload_progress) as f:
+                    # FIXME: Why doesn't requests accept the certificate?
+                    requests.post(disk_url, data=f, verify=False)
+            except (IOError, requests.RequestException) as err:
+                self.logger.warn('Failed to upload base image ({0})'.format(err))
+                lease.HttpNfcLeaseAbort()
+                return False
 
             lease.HttpNfcLeaseComplete()
 
             if lease.state != vim.HttpNfcLease.State.done:
-                self.log('provisioning of virtual machine failed')
+                self.logger.warn('Provisioning of virtual machine failed')
                 return False
 
             machine = self._get_machine()
@@ -494,18 +501,17 @@ class VSphereState(MachineState):
             guest_config_spec.extraConfig.append(
                 vim.option.OptionValue(key='guestinfo.sshAuthorizedKeys', value=self.client_public_key))
 
-            self.log_start('configuring VM...')
+            self.logger.log('Configuring VM...')
             reconfig_task = machine.ReconfigVM_Task(guest_config_spec)
             while reconfig_task.info.state == vim.TaskInfoState.running \
                     or reconfig_task.info.state == vim.TaskInfoState.queued:
-                self.log_continue('.')
                 time.sleep(0.1)
 
             if reconfig_task.info.state == vim.TaskInfoState.error:
-                self.log_end(' FAILED')
+                self.logger.warn('Failed to configure virtual machine {0}'.format(reconfig_task.info.error))
+                machine.Destroy()
                 return False
 
-            self.log_end('')
             self.state = self.STOPPED
 
         if self.state == self.STOPPED:
@@ -522,24 +528,24 @@ class VSphereState(MachineState):
         self.ip_address = new_address
 
     def _wait_for_ip(self):
-        self.log_start('waiting for IP address...')
+        self.logger.log_start('Waiting for IP address...')
         while True:
             self._update_ip()
             if self.ip_address is not None:
                 break
             time.sleep(1)
-            self.log_continue('.')
-        self.log_end(' ' + self.ip_address)
+            self.logger.log_continue('.')
+        self.logger.log_end(' ' + self.ip_address)
 
     def start(self):
         if self.state != self.STOPPED:
-            self.logger.warn("Machine must be in state STOPPED to be started")
+            self.logger.warn('Machine must be in state STOPPED to be started')
             return
 
         machine = self._get_machine()
         assert machine
 
-        self.log('starting machine...')
+        self.logger.log('Starting machine...')
         machine.PowerOn()
         self.state = self.STARTING
 
@@ -548,23 +554,23 @@ class VSphereState(MachineState):
 
     def stop(self):
         if self.state != self.UP:
-            self.logger.warn("Machine must be in state UP to be stopped")
+            self.logger.warn('Machine must be in state UP to be stopped')
             return
 
         machine = self._get_machine()
         assert machine
 
-        self.log_start('shutting down...')
+        self.logger.log_start('Shutting down...')
         self.state = self.STOPPING
 
         # FIXME: Maybe use the vSphere API when the open-vm-tools are fixed (they currently try to use /sbin/shutdown)
         self.run_command('systemctl poweroff', check=False)
 
         while machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
-            self.log_continue('.')
+            self.logger.log_continue('.')
             time.sleep(1)
 
-        self.log_end('')
+        self.logger.log_end('')
         self.state = self.STOPPED
 
     def get_ssh_name(self):
