@@ -569,6 +569,9 @@ class VSphereState(MachineState):
         machine = self._get_machine()
 
         if machine:
+            if not self.depl.logger.confirm("Are you sure you want to destroy VM ‘{0}’?".format(self.name)):
+                return False
+
             if machine.runtime.powerState == vim.VirtualMachinePowerState.poweredOn:
                 self.stop()
 
