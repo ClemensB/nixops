@@ -96,7 +96,7 @@ rec {
           datadog
           digital-ocean
           pyvmomi
-          requests2
+          requests
         ];
 
       # For "nix-build --run-env".
