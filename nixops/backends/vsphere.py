@@ -453,8 +453,24 @@ class VSphereState(MachineState):
 
             resource_pool = cluster.resourcePool
 
+            # Associate networks in the VM definition to the vSphere networks
+            si = self._get_service_instance()
+            network_mapping = []
+            for network_name in defn.config['vsphere']['networks']:
+                for network in si.content.viewManager.CreateContainerView(si.content.rootFolder, [vim.Network], True).view:
+                    if network.name == network_name:
+                        mapping = vim.OvfNetworkMapping()
+                        mapping.name = network.name
+                        mapping.network = network
+                        network_mapping.append(mapping)
+                        break
+                else:
+                    self.logger.warn('No matching network "{0}" found on hypervisor'.format(network_name))
+                    return False
+
             manager = self._get_service_instance().content.ovfManager
             spec_params = vim.OvfManager.CreateImportSpecParams()
+            spec_params.networkMapping = network_mapping
             import_spec = manager.CreateImportSpec(ovf, resource_pool, datastore, spec_params)
 
             self.logger.log('importing virtual machine to vSphere...')
