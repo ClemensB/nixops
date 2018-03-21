@@ -22,8 +22,14 @@ let
           '';
       }
       ''
-        . /sys/class/block/vda1/uevent
-        mknod /dev/vda1 b $MAJOR $MINOR
+        # TODO (@Ma27) remove this entirely after NixOS 17.09 is EOLed, in
+        # 18.03 `devtmpfs` is used which makes the block creation obsolete
+        # (see https://github.com/NixOS/nixpkgs/commit/0d27df280f7ed502bba65e2ea13469069f9b275a)
+        if [ ! -b /dev/vda1 ]; then
+          . /sys/class/block/vda1/uevent
+          mknod /dev/vda1 b $MAJOR $MINOR
+        fi
+
         mkdir /mnt
         mount /dev/vda1 /mnt
 
@@ -105,6 +111,30 @@ in
       default = "";
       type = types.str;
       description = "Additional XML appended at the end of domain xml. See https://libvirt.org/formatdomain.html";
+    };
+
+    deployment.libvirtd.domainType = mkOption {
+      default = "kvm";
+      type = types.str;
+      description = "Specify the type of libvirt domain to create (see '$ virsh capabilities | grep domain' for valid domain types";
+    };
+
+    deployment.libvirtd.cmdline = mkOption {
+      default = "";
+      type = types.str;
+      description = "Specify the kernel cmdline (valid only with the kernel setting).";
+    };
+
+    deployment.libvirtd.initrd = mkOption {
+      default = "";
+      type = types.str;
+      description = "Specify the kernel initrd (valid only with the kernel setting).";
+    };
+
+    deployment.libvirtd.kernel = mkOption {
+      default = "";
+      type = types.str; # with types; nullOr path;
+      description = "Specify the host kernel to launch (valid for kvm).";
     };
   };
 

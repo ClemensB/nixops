@@ -336,7 +336,7 @@ in
 
 </section>
 
-<section xml:id="sec-deploying-to-ec2"><title>Deploying to a NixOS machine</title>
+<section xml:id="sec-deploying-to-physical-nixos"><title>Deploying to a NixOS machine</title>
 
 <para>To deploy to a machine that is already running NixOS, simply set
 <varname>deployment.targetHost</varname> to the IP address or host name of the machine,
@@ -455,7 +455,7 @@ This terminates the EC2 instances and deletes the EC2 key pair.</para>
   key to the file <filename>~/.ec2-keys</filename>, as follows:
 
 <programlisting>
-AKIAIUTDLWJKSLSJDLDQ Grsjf37cDKKWndklek3jdxnSKE3fkskDLqdldDl/ dev # my AWS development account
+AKIABOGUSACCESSKEY BOGUSSECRETACCESSKEY dev # my AWS development account
 </programlisting>
 
   Here <literal>dev</literal> is a symbolic name for the AWS account,
@@ -467,8 +467,8 @@ AKIAIUTDLWJKSLSJDLDQ Grsjf37cDKKWndklek3jdxnSKE3fkskDLqdldDl/ dev # my AWS devel
 
 <programlisting>
 [dev]
-aws_access_key_id = AKIAIUTDLWJKSLSJDLDQ
-aws_secret_access_key = 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
+aws_access_key_id = AKIABOGUSACCESSKEY
+aws_secret_access_key = BOGUSSECRETACCESSKEY
 </programlisting>
 
   Profile name <literal>dev</literal> is the same as a previously
@@ -721,7 +721,31 @@ $ openssl pkcs12 -in pkey.pkcs12 -passin pass:notasecret -nodes -nocerts | opens
   is impossible to create public images. Default bootstrap image specification can be
   overriden by defining <literal>resources.gceImages.bootstrap</literal>. Additionally,
   the instance's <literal>bootstrapImage</literal> option can be used to specify
-  an instance-specific bootstrap image.</para></listitem>
+  an instance-specific bootstrap image.</para>
+
+  <para>A solution is to create one's own image, by running the script
+  in <literal>&lt;nixpkgs/nixos/maintainers/scripts/gce/create-gce.sh&gt;</literal>.
+  Two things need to be done before running the script:
+  <itemizedList>
+    <listitem>Set the <literal>BUCKET_NAME</literal> environment
+    variable to the target Google Storage bucket's name</listitem>.
+    <listitem>Add permissions to that bucket for the "Compute Engine"
+    service account (under the Google Cloud console, IAM &amp;
+    Administration, IAM)</listitem>
+  </itemizedList>
+  Then, add the corresponding resources (i.e. at the top level of the
+  nixops deployment):
+  <example><programlisting>
+resources.gceImages.my-bootstrap = {
+  name = "my-bootstrap";
+  project = "…";
+  serviceAccount = "…";
+  accessKey = "…";
+  sourceUri = "gs://my-bucket/nixos-image-18.03.git.fa98773-x86_64-linux.raw.tar.gz";
+};
+  </programlisting></example>
+  </para>
+  </listitem>
 
   <listitem><para>There's no "native" support for starting and stopping instances.
   NixOps emulates starting and stoping by creating and tearing down GCE instances,
@@ -958,50 +982,58 @@ This terminates the Azure instances and deletes the alternative native load bala
 <itemizedlist>
 
   <listitem><para>You need Azure credentials to authenticate requests.
-  The authentication methods supported are user/password and service principal/password.
-  You need to ensure your Azure account has an Active Directory, and add a user or service principal to it.
-  Refer to these guides:
-  <link xlink:href="http://innerdot.com/azure/a-gaffers-guide-to-azure-introduction-and-getting-started">
-  creating an active directory and users</link> and
-  <link xlink:href="http://innerdot.com/azure/a-gaffers-guide-to-azure-service-principals-and-applications">
-  applications and service principals</link>.
+  The authentication methods supported is using Azure Active Directory's application ID and key.
+  You need to ensure your Azure account has an Active Directory, and add a application to it.
+    <para>To create Active Directory's application guides:
+      1. Open "Cloud Shell". (The ">_" icon in right up.)
+      2. Input those. (See <link xlink:href="https://github.com/Azure/vagrant-azure/issues/164">this link</link>.
+      <screen>
+        $ az ad sp create-for-rbac
+      </screen>
+      3. Go to "Azure Active Directory" (from left panel)
+      4. (Manage section) "App registrations"
+      5. Select created application.
+      6. Application ID can be get. (nixops appId)
+      7. "Keys"
+      8. Add key name, expiration period and click "save", copy the generate key as "nixops appKey"
+    </para>
   </para></listitem>
 
   <listitem><para>You must supply the credentials(subscription ID, authority URL,
-  user or service principal, password) to your deployments via either
-  <literal>*.subscriptionId</literal>, <literal>*.authority</literal>, <literal>*.user</literal>,
-  <literal>*.servicePrincipal</literal> and <literal>*.password</literal>
+  application ID, application Key) to your deployments via either
+  <literal>*.subscriptionId</literal>, <literal>*.authority</literal>, <literal>*.appId</literal> and <literal>*.appKey</literal>
   options or <literal>AZURE_SUBSCRIPTION_ID</literal>, <literal>AZURE_AUTHORITY_URL</literal>,
-  <literal>AZURE_USER</literal>, <literal>AZURE_SERVICE_PRINCIPAL</literal>
-  and <literal>AZURE_PASSWORD</literal> environment variables.
+  <literal>AZURE_ACTIVE_DIR_APP_ID</literal> and <literal>AZURE_ACTIVE_DIR_APP_KEY</literal> environment variables.
   Options take precedence over environment variables and are specified per resource/machine.
   </para>
 
-  <para>You must specify either user or service principal but not both.
-  If either <literal>*.user</literal> or <literal>*.servicePrincipal</literal> is set,
-  both <literal>AZURE_USER</literal> and <literal>AZURE_SERVICE_PRINCIPAL</literal>
-  are ignored for the resource.</para>
-
-  <para>Example credentials for user/password authentication:
+  <para>Example credentials for application ID/application key authentication:
 <programlisting>
 credentials = {
   subscriptionId = "00000000-0000-0000-0000-000000000000";
   authority = "https://login.windows.net/YOURDIRECTORYNAME.onmicrosoft.com";
-  user = "user@YOURDIRECTORYNAME.onmicrosoft.com";
-  password = "**********";
+  appId = "44444444-4444-4444-4444-444444444444";
+  appKey = "********************";
 };
 </programlisting>
-  </para>
 
-  <para>Example credentials for service principal/password authentication:
-<programlisting>
-credentials = {
-  subscriptionId = "00000000-0000-0000-0000-000000000000";
-  authority = "https://login.windows.net/YOURDIRECTORYNAME.onmicrosoft.com";
-  servicePrincipal = "44444444-4444-4444-4444-444444444444";
-  password = "**********";
-};
-</programlisting>
+To get Service Principal credentials:
+1. Go to "Azure Active Directory" (from left panel)
+2. (Manage section) "App registrations"
+3. "New application registration"
+4. Type application name (needed later), and random SignOnURL or RedirectURL
+5. Application ID is your Service Principal ID (nixops servicePrincipal)
+6. Click on your application
+7. "Keys"
+8. Add key name, expiration period and click "save", copy the generate key as "nixops password"
+9. Go to "Subscriptions" (from left panel)
+10. Select your subscription
+11. Select "Access control (IAM)"
+12. "Add"
+13. Select "role" (permissions that nixops needs)
+14. Next type application name you just created
+15. "Save"
+16. Profit?
   </para>
 
   <para>Authority URL can also be specified as
@@ -1518,7 +1550,6 @@ and libvirtd specification <literal>example-libvirtd.nix</literal>:
 {
   example = {
     deployment.targetEnv = "libvirtd";
-    deployment.libvirtd.headless = true;
   };
 }
 </programlisting>
@@ -1532,13 +1563,20 @@ and libvirtd specification <literal>example-libvirtd.nix</literal>:
 </programlisting>
 </para>
 
-<warning>
-<para>Note that headless mode has to be turned ON for the moment in order to
-  avoid X permissions error currently
-  <link xlink:href="https://github.com/NixOS/nixops/issues/422">
-  known to be broken upstream</link>
-</para>
-</warning>
+
+<note>
+
+<title>Graphics Display and Console</title>
+<para>It's possible to connect a VNC viewer to the guest to see the
+graphics display (X11) or the framebuffer console.</para>
+
+<para>To do this, ensure the
+<literal>deployment.libvirtd.headless</literal> option is set to
+<literal>false</literal> (the default).  Then use the <literal>virsh
+vncdisplay</literal> command to get a VNC connection string to pass to
+your VNC viewer.</para>
+
+</note>
 
 <note>
 
@@ -1700,6 +1738,62 @@ This indicates that Apache httpd has failed on
 <literal>backend</literal> is not running at all.  In this situation,
 you should run <command>nixops deploy --check</command> to repair the
 deployment.</para>
+
+</section>
+
+<section><title>Network special attributes</title>
+
+<para>
+It is possible to define special options for the whole network. For example:
+
+<screen>
+{
+  network = {
+    description = "staging environment";
+    enableRollback = true;
+  };
+
+  defaults = {
+    imports = [ ./common.nix ];
+  };
+
+  machine = { ... }: {};
+}
+</screen>
+
+Each attribute is explained below:
+
+</para>
+
+
+<variablelist>
+
+  <varlistentry><term><option>defaults</option></term>
+
+    <listitem><para>Applies given NixOS module to all machines defined in the network.
+    </para></listitem>
+
+  </varlistentry>
+
+  <varlistentry><term><option>network.description</option></term>
+
+    <listitem><para>A sentence describing the purpose of the network
+    for easier comparison when running <command>nixops list</command>
+    </para></listitem>
+
+  </varlistentry>
+
+  <varlistentry><term><option>network.enableRollback</option></term>
+
+  <listitem><para>If <literal>true</literal>, each deployment creates
+  a new profile generation to able to run <command>nixops rollback</command>.
+  Defaults to <literal>false</literal>.
+  </para></listitem>
+
+  </varlistentry>
+
+</variablelist>
+
 
 </section>
 

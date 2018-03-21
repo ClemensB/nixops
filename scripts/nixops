@@ -237,11 +237,15 @@ def op_check():
          ('Disks OK', 'l'), ('Load avg.', 'l'), ('Units', 'l'), ('Notes', 'l')])
 
     machines = []
+    resources = []
 
     def check(depl):
-        for m in depl.active.itervalues():
+        for m in depl.active_resources.itervalues():
             if not nixops.deployment.should_do(m, args.include or [], args.exclude or []): continue
-            machines.append(m)
+            if nixops.deployment.is_machine(m):
+                machines.append(m)
+            else:
+                resources.append(m)
 
     for depl in one_or_all(): check(depl)
 
@@ -273,14 +277,34 @@ def op_check():
         if res.failed_units != None and res.failed_units != []: status |= 16
         return (m.depl.name or m.depl.uuid, m, row, status)
 
+    resources_tbl = create_table(
+            ([('Deployment', 'l')] if args.all else []) +
+            [('Name', 'l'), ('Exists', 'l')])
+
+    def resource_worker(r):
+        if not nixops.deployment.is_machine(r):
+            r.check()
+            exist = True if r.state == nixops.resources.ResourceState.UP else False
+            row = ([r.depl.name or r.depl.uuid] if args.all else []) + \
+                [r.name, render_tristate(exist)]
+            return (r.depl.name or r.depl.uuid, r, row, 0)
+
     results = run_tasks(nr_workers=len(machines), tasks=machines, worker_fun=worker)
+    resources_results = run_tasks(nr_workers=len(resources), tasks=resources, worker_fun=resource_worker)
 
     # Sort the rows by deployment/machine.
     status = 0
     for res in sorted(results, key=lambda res: machine_to_key(res[0], res[1].name, res[1].get_type())):
         tbl.add_row(res[2])
         status |= res[3]
+    print nixops.util.ansi_success("Machines state:")
     print tbl
+
+    for res in  sorted(resources_results, key=lambda res: machine_to_key(res[0], res[1].name, res[1].get_type())):
+        resources_tbl.add_row(res[2])
+        status |= res[3]
+    print nixops.util.ansi_success("Non machines resources state:")
+    print resources_tbl
 
     sys.exit(status)
 
@@ -365,8 +389,10 @@ def op_deploy():
     depl = open_deployment()
     if args.confirm:
         depl.logger.set_autoresponse("y")
-    depl.deploy(dry_run=args.dry_run, evaluate_only=args.evaluate_only,
-                build_only=args.build_only,
+    if args.evaluate_only:
+        raise Exception("--evaluate-only was removed as it's the same as --dry-run")
+    depl.deploy(dry_run=args.dry_run,
+                build_only=args.build_only, plan_only=args.plan_only,
                 create_only=args.create_only, copy_only=args.copy_only,
                 include=args.include or [], exclude=args.exclude or [],
                 check=args.check, kill_obsolete=args.kill_obsolete,
@@ -376,7 +402,8 @@ def op_deploy():
                 max_concurrent_copy=args.max_concurrent_copy,
                 sync=not args.no_sync,
                 always_activate=args.always_activate,
-                repair=args.repair, dry_activate=args.dry_activate)
+                repair=args.repair, dry_activate=args.dry_activate,
+                max_concurrent_activate=args.max_concurrent_activate)
 
 
 def op_send_keys():
@@ -604,7 +631,7 @@ def op_show_option():
     depl = open_deployment()
     if args.include_physical:
         depl.evaluate()
-    sys.stdout.write(depl.evaluate_option_value(args.machine, args.option, xml=args.xml, include_physical=args.include_physical))
+    sys.stdout.write(depl.evaluate_option_value(args.machine, args.option, json=args.json, xml=args.xml, include_physical=args.include_physical))
 
 
 def check_rollback_enabled():
@@ -630,8 +657,9 @@ def op_rollback():
     depl = check_rollback_enabled()
     depl.rollback(generation=args.generation,
                   include=args.include or [], exclude=args.exclude or [],
-                  check=args.check, allow_reboot=args.allow_reboot, force_reboot=args.force_reboot,
-                  max_concurrent_copy=args.max_concurrent_copy,
+                  check=args.check, allow_reboot=args.allow_reboot,
+                  force_reboot=args.force_reboot, max_concurrent_copy=args.max_concurrent_copy,
+                  max_concurrent_activate=args.max_concurrent_activate,
                   sync=not args.no_sync)
 
 
@@ -708,7 +736,7 @@ def add_subparser(name, help):
     subparser.add_argument("--cores", type=int, metavar='N', help='sets the value of the NIX_BUILD_CORES environment variable in the invocation of builders')
     subparser.add_argument("--keep-going", action='store_true', help='keep going after failed builds')
     subparser.add_argument("--keep-failed", '-K', action='store_true', help='keep temporary directories of failed builds')
-    subparser.add_argument('--show-trace', action='store_true', help='print a Nix stack trace if evaluation fails')
+    subparser.add_argument('--show-trace', action='store_true', help='print a Nix stack trace if evaluation fails, or a python stack trace if nixops fails')
     subparser.add_argument('--fallback', action='store_true', help='fall back on installation from source')
     subparser.add_argument('--no-build-output', action='store_true', help='suppress output written by builders')
     subparser.add_argument('--option', nargs=2, action="append", dest="nix_options", metavar=('NAME', 'VALUE'), help='set a Nix option')
@@ -748,7 +776,8 @@ subparser.add_argument('--all',  action='store_true', help='show all deployments
 subparser.add_argument('--plain',  action='store_true', help='do not pretty-print the output')
 subparser.add_argument('--no-eval', action='store_true', help='do not evaluate the deployment specification')
 
-subparser = add_subparser('check', help='check the state of the machines in the network')
+subparser = add_subparser('check', help='check the state of the machines in the network'
+                          ' (note that this might alter the internal nixops state to consolidate with the real state of the resource)')
 subparser.set_defaults(op=op_check)
 subparser.add_argument('--all',  action='store_true', help='check all deployments')
 subparser.add_argument('--include', nargs='+', metavar='MACHINE-NAME', help='check only the specified machines')
@@ -767,15 +796,17 @@ def add_common_deployment_options(subparser):
     subparser.add_argument('--allow-reboot', action='store_true', help='reboot machines if necessary')
     subparser.add_argument('--force-reboot', action='store_true', help='reboot machines unconditionally')
     subparser.add_argument('--max-concurrent-copy', type=int, default=5, metavar='N', help='maximum number of concurrent nix-copy-closure processes')
+    subparser.add_argument('--max-concurrent-activate', type=int, default=-1, metavar='N', help='maximum number of concurrent machine activations')
     subparser.add_argument('--no-sync', action='store_true', help='do not flush buffers to disk')
 
 subparser = add_subparser('deploy', help='deploy the network configuration')
 subparser.set_defaults(op=op_deploy)
 subparser.add_argument('--kill-obsolete', '-k', action='store_true', help='kill obsolete virtual machines')
-subparser.add_argument('--dry-run', action='store_true', help='show what will be built')
+subparser.add_argument('--dry-run', action='store_true', help='evaluate and print what would be built')
 subparser.add_argument('--dry-activate', action='store_true', help='show what will be activated on the machines in the network')
 subparser.add_argument('--repair', action='store_true', help='use --repair when calling nix-build (slow)')
 subparser.add_argument('--evaluate-only', action='store_true', help='only call nix-instantiate and exit')
+subparser.add_argument('--plan-only', action='store_true', help='show the diff between the configuration and the state and exit')
 subparser.add_argument('--build-only', action='store_true', help='build only; do not perform deployment actions')
 subparser.add_argument('--create-only', action='store_true', help='exit after creating missing machines')
 subparser.add_argument('--copy-only', action='store_true', help='exit after copying closures')
@@ -899,6 +930,7 @@ subparser.set_defaults(op=op_show_option)
 subparser.add_argument('machine', metavar='MACHINE', help='identifier of the machine')
 subparser.add_argument('option', metavar='OPTION', help='option name')
 subparser.add_argument('--xml', action='store_true', help='print the option value in XML format')
+subparser.add_argument('--json', action='store_true', help='print the option value in JSON format')
 subparser.add_argument('--include-physical', action='store_true', help='include the physical specification in the evaluation')
 
 subparser = add_subparser('list-generations', help='list previous configurations to which you can roll back')
@@ -958,10 +990,10 @@ except KeyboardInterrupt:
     sys.exit(1)
 except MultipleExceptions as e:
     error(str(e))
-    if args.debug or str(e) == "":
+    if args.debug or args.show_trace or str(e) == "":
         e.print_all_backtraces()
     sys.exit(1)
 except Exception as e:
-    if args.debug or str(e) == "": raise
+    if args.debug or args.show_trace or str(e) == "": raise
     error(str(e))
     sys.exit(1)

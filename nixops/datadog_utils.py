@@ -2,8 +2,11 @@
 
 from datadog import initialize, api
 import os
+import time
 
-def initializeDatadog(api_key, app_key):
+GENERATED = 'NIXOPS GENERATED'
+
+def initializeDatadog(api_key = None, app_key = None):
     if not api_key: api_key = os.environ.get('DATADOG_API_KEY')
     if not app_key: app_key = os.environ.get('DATADOG_APP_KEY')
     if not api_key or not app_key:
@@ -25,3 +28,63 @@ def get_template_variables(defn):
 
 def get_base_url():
     return "https://app.datadoghq.com/"
+
+def get_active_downtimes(uuid):
+    downtimes = api.Downtime.get_all()
+    if 'errors' in downtimes:
+        raise Exception("Failed getting downtimes: "+downtimes['errors'])
+    downtimes = filter(lambda dt: dt['scope'] == [ 'uuid:{}'.format(uuid) ] and dt['active'] and dt['message']==GENERATED, downtimes)
+    return downtimes
+
+def create_downtime(depl):
+    if not depl.datadog_downtime: return
+
+    dts = get_active_downtimes(depl.uuid)
+    start = int(time.time())
+    end = start + depl.datadog_downtime_seconds
+
+    if len(dts) == 0:
+        dt = api.Downtime.create(
+            scope='uuid:{}'.format(depl.uuid),
+            start=start,
+            end=end,
+            message=GENERATED
+        )
+        depl.logger.log("created Datadog downtime with id {}".format(dt['id']))
+    elif len(dts) == 1:
+        api.Downtime.update(
+            dts[0]['id'],
+            scope='uuid:{}'.format(depl.uuid),
+            start=start,
+            end=end,
+            message=GENERATED
+        )
+        depl.logger.log('updated Datadog downtime with id {}'.format(dts[0]['id']))
+    else:
+        raise Exception("Found more than one active Datadog downtimes with scope uuid:{}.".format(depl.uuid))
+
+def delete_downtime(depl):
+    if not depl.datadog_downtime: return
+    initializeDatadog()
+
+    dts = get_active_downtimes(depl.uuid)
+
+    if len(dts) == 0:
+        depl.logger.warn("Could not find an active Datadog downtime with scope uuid:{}.".format(depl.uuid))
+    elif len(dts) == 1:
+        depl.logger.log("deleting Datadog downtime with id {}".format(dts[0]['id']))
+        api.Downtime.delete(dts[0]['id'])
+    else:
+        if depl.logger.confirm("Found more than one Datadog downtimes with scope uuid:{}, would you like to delete them all? If no, nixops will not delete any.".format(depl.uuid)):
+            for dt in dts:
+                depl.logger.log("deleting Datadog downtime with id {}".format(dt['id']))
+                api.Downtime.delete(dt['id'])
+
+def create_event(depl, title, text='', tags=[]):
+    if not depl.datadog_notify: return
+    initializeDatadog()
+
+    try:
+        api.Event.create(title=title, text=text, tags=tags + [ 'uuid:{}'.format(depl.uuid), 'deployment:{}'.format(depl.name)])
+    except:
+        depl.logger.warn('Failed creating event in datadog, ignoring.')

@@ -45,7 +45,7 @@ class MachineState(nixops.resources.ResourceState):
     ssh_pinged = nixops.util.attr_property("sshPinged", False, bool)
     ssh_port = nixops.util.attr_property("targetPort", 22, int)
     public_vpn_key = nixops.util.attr_property("publicVpnKey", None)
-    store_keys_on_machine = nixops.util.attr_property("storeKeysOnMachine", True, bool)
+    store_keys_on_machine = nixops.util.attr_property("storeKeysOnMachine", False, bool)
     keys = nixops.util.attr_property("keys", {}, 'json')
     owners = nixops.util.attr_property("owners", [], 'json')
 
@@ -87,6 +87,8 @@ class MachineState(nixops.resources.ResourceState):
         self.keys = defn.keys
         self.ssh_port = defn.ssh_port
         self.has_fast_connection = defn.has_fast_connection
+        if not self.has_fast_connection:
+            self.ssh.enable_compression()
 
     def stop(self):
         """Stop this machine, if possible."""
@@ -232,9 +234,15 @@ class MachineState(nixops.resources.ResourceState):
                 raise Exception("Neither 'text' or 'keyFile' options were set for key '{0}'.".format(k))
 
             outfile = destDir + "/" + k
+            # We scp to a temporary file and then mv because scp is not atomic.
+            # See https://github.com/NixOS/nixops/issues/762
+            tmp_outfile = destDir + "/." + k + ".tmp"
             outfile_esc = "'" + outfile.replace("'", r"'\''") + "'"
-            self.run_command("rm -f " + outfile_esc)
-            self.upload_file(tmp, outfile)
+            tmp_outfile_esc = "'" + tmp_outfile.replace("'", r"'\''") + "'"
+            self.run_command("rm -f " + outfile_esc + " " + tmp_outfile_esc)
+            self.upload_file(tmp, tmp_outfile)
+            # For permissions we use the temporary file as well, so that
+            # the final outfile will appear atomically with the right permissions.
             self.run_command(
               ' '.join([
                 # chown only if user and group exist,
@@ -248,12 +256,13 @@ class MachineState(nixops.resources.ResourceState):
                 "chmod '{3}' {0}",
               ])
               .format(
-                outfile_esc,
+                tmp_outfile_esc,
                 opts['user'],
                 opts['group'],
                 opts['permissions']
               )
             )
+            self.run_command("mv " + tmp_outfile_esc + " " + outfile_esc)
             os.remove(tmp)
         self.run_command("mkdir -m 0750 -p /run/keys && "
                          "chown root:keys  /run/keys && "
@@ -354,7 +363,7 @@ class MachineState(nixops.resources.ResourceState):
         env['NIX_SSHOPTS'] = ' '.join(ssh._get_flags() + ssh.get_master().opts)
         self._logged_exec(
             ["nix-copy-closure", "--to", ssh._get_target(), path]
-            + ([] if self.has_fast_connection else ["--gzip", "--use-substitutes"]),
+            + ([] if self.has_fast_connection else ["--use-substitutes"]),
             env=env)
 
     def generate_vpn_key(self):

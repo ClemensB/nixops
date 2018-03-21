@@ -53,7 +53,7 @@ def logged_exec(command, logger, check=True, capture_stdout=False, stdin=None,
     functionality as well.
 
     When calling with capture_stdout=True, a string is returned, which contains
-    everything the programm wrote to stdout.
+    everything the program wrote to stdout.
 
     When calling with check=False, the return code isn't checked and the
     function will return an integer which represents the return code of the
@@ -80,6 +80,21 @@ def logged_exec(command, logger, check=True, capture_stdout=False, stdin=None,
     # FIXME: this can deadlock if stdin_string doesn't fit in the
     # kernel pipe buffer.
     if stdin_string is not None:
+        # PIPE_BUF is not the size of the kernel pipe buffer (see
+        # https://unix.stackexchange.com/questions/11946/how-big-is-the-pipe-buffer)
+        # but if something fits in PIPE_BUF, it'll fit in the kernel pipe
+        # buffer.
+        # So we use PIPE_BUF as the threshold to emit a warning,
+        # so that if the deadlock described above does happen,
+        # the user at least knows what the cause is.
+        if len(stdin_string) > select.PIPE_BUF:
+            sys.stderr.write(
+                ("Warning: Feeding more than PIPE_BUF = {} bytes ({})" +
+                " via stdin to a subprocess. This may deadlock." +
+                " Please report it as a bug if you see it happen," +
+                " at https://github.com/NixOS/nixops/issues/800\n"
+                ).format(select.PIPE_BUF, len(stdin_string)))
+
         process.stdin.write(stdin_string)
         process.stdin.close()
 
@@ -134,6 +149,7 @@ def logged_exec(command, logger, check=True, capture_stdout=False, stdin=None,
         msg = "command ‘{0}’ failed on machine ‘{1}’"
         err = msg.format(command, logger.machine_name)
         raise CommandFailed(err, res)
+
     return stdout if capture_stdout else res
 
 
@@ -148,22 +164,32 @@ def make_non_blocking(fd):
     fcntl.fcntl(fd, fcntl.F_SETFL, fcntl.fcntl(fd, fcntl.F_GETFL) | os.O_NONBLOCK)
 
 
-def ping_tcp_port(ip, port, timeout=1, ensure_timeout=False):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.settimeout(timeout)
-    s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
-    try:
-        s.connect((ip, port))
-    except socket.timeout:
-        return False
-    except:
-        # FIXME: check that we got a transient error (like connection
-        # refused or no route to host). For any other error, throw an
-        # exception.
-        if ensure_timeout: time.sleep(timeout)
-        return False
-    s.shutdown(socket.SHUT_RDWR)
-    return True
+def ping_tcp_port(host, port, timeout=1, ensure_timeout=False):
+    """"
+    Return to True or False depending on being able to connect the specified host and port.
+    Raises exceptions which are not related to opening a socket to the target host.
+    """
+    infos = socket.getaddrinfo(host, port, 0, 0, socket.IPPROTO_TCP)
+    for info in infos:
+        s = socket.socket(info[0], info[1])
+        s.settimeout(timeout)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+        try:
+            s.connect(info[4])
+        except socket.timeout:
+            # try next address
+            continue
+        except EnvironmentError:
+            # Reset, Refused, Aborted, No route to host
+            if ensure_timeout: time.sleep(timeout)
+            # continue with the next address
+            continue
+        except:
+            raise
+        else:
+            s.shutdown(socket.SHUT_RDWR)
+            return True
+    return False
 
 
 def wait_for_tcp_port(ip, port, timeout=-1, open=True, callback=None):
@@ -206,7 +232,11 @@ def abs_nix_path(x):
     return xs[0] + '=' + _maybe_abspath(xs[1])
 
 
-undefined = object()
+class Undefined:
+    pass
+
+undefined = Undefined()
+
 
 def attr_property(name, default, type=str):
     """Define a property that corresponds to a value in the NixOps state file."""
@@ -319,7 +349,8 @@ def xml_expr_to_python(node):
     if node.tag == "attrs":
         res = {}
         for attr in node.findall("attr"):
-            res[attr.get("name")] = xml_expr_to_python(attr.find("*"))
+            if attr.get("name") != "_module":
+                res[attr.get("name")] = xml_expr_to_python(attr.find("*"))
         return res
 
     elif node.tag == "list":

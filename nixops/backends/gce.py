@@ -2,7 +2,7 @@
 
 from nixops import known_hosts
 from nixops.util import attr_property, create_key_pair, generate_random_string
-from nixops.nix_expr import RawValue, Call
+from nixops.nix_expr import Function, RawValue, Call
 
 from nixops.backends import MachineDefinition, MachineState
 
@@ -51,6 +51,9 @@ class GCEDefinition(MachineDefinition, ResourceDefinition):
 
         self.ipAddress = self.get_option_value(x, 'ipAddress', 'resource', optional = True)
         self.copy_option(x, 'network', 'resource', optional = True)
+        self.copy_option(x, 'subnet', str, optional = True)
+        self.labels = { k.get("name"): k.find("string").get("value")
+                        for k in x.findall("attr[@name='labels']/attrs/attr") }
 
         def opt_disk_name(dname):
             return ("{0}-{1}".format(self.machine_name, dname) if dname is not None else None)
@@ -112,6 +115,7 @@ class GCEState(MachineState, ResourceState):
 
     tags = attr_property("gce.tags", None, 'json')
     metadata = attr_property("gce.metadata", {}, 'json')
+    labels = attr_property("gce.labels", {}, 'json')
     email = attr_property("gce.serviceAccountEmail", 'default')
     scopes = attr_property("gce.serviceAccountScopes", [], 'json')
     automatic_restart = attr_property("gce.scheduling.automaticRestart", None, bool)
@@ -119,6 +123,7 @@ class GCEState(MachineState, ResourceState):
     on_host_maintenance = attr_property("gce.scheduling.onHostMaintenance", None)
     ipAddress = attr_property("gce.ipAddress", None)
     network = attr_property("gce.network", None)
+    subnet = attr_property("gce.subnet", None)
 
     block_device_mapping = attr_property("gce.blockDeviceMapping", {}, 'json')
 
@@ -198,7 +203,7 @@ class GCEState(MachineState, ResourceState):
             self.update_block_device_mapping(k, v)
 
     defn_properties = ['tags', 'region', 'instance_type',
-                       'email', 'scopes',
+                       'email', 'scopes', 'subnet',
                        'metadata', 'ipAddress', 'network']
 
     def is_deployed(self):
@@ -347,9 +352,9 @@ class GCEState(MachineState, ResourceState):
                 v['region'] = defn.region
                 try:
                     self.connect().create_volume(v['size'], v['disk_name'], v['region'],
-                                                  snapshot = v['snapshot'], image = v['image'],
-                                                  ex_disk_type = "pd-" + v.get('type', 'standard'),
-                                                  use_existing= False)
+                                                snapshot=v['snapshot'], image=v['image'],
+                                                ex_disk_type="pd-" + v.get('type', 'standard'),
+                                                use_existing=False)
                 except AttributeError:
                     # libcloud bug: The region we're trying to create the disk
                     # in doesn't exist.
@@ -367,8 +372,10 @@ class GCEState(MachineState, ResourceState):
                 self.warn("change of the instance type requires a reboot")
 
             if self.network != defn.network:
-                recreate = True
-                self.warn("change of the network requires a reboot")
+                raise Exception("change of network is currently not supported")
+
+            if self.subnet != defn.subnet:
+                raise Exception("change of subnet is currently not supported")
 
             if self.email != defn.email or self.scopes != defn.scopes:
                 recreate = True
@@ -416,7 +423,13 @@ class GCEState(MachineState, ResourceState):
                                  ex_boot_disk = self.connect().ex_get_volume(boot_disk['disk_name'] or boot_disk['disk'], boot_disk.get('region', None)),
                                  ex_metadata = self.full_metadata(defn.metadata), ex_tags = defn.tags, ex_service_accounts = service_accounts,
                                  external_ip = (self.connect().ex_get_address(defn.ipAddress) if defn.ipAddress else 'ephemeral'),
-                                 ex_network = (defn.network if defn.network else 'default') )
+                                 # in theory the API accepts creating an
+                                 # instance by specifying only the subnet
+                                 # but this seems to be a libcloud issue
+                                 # where it doesn't accept None for
+                                 # ex_network argument.
+                                 ex_network = (defn.network if defn.network else 'default'),
+                                 ex_subnetwork = (defn.subnet if defn.subnet is not None else None) )
             except libcloud.common.google.ResourceExistsError:
                 raise Exception("tried creating an instance that already exists; "
                                 "please run 'deploy --check' to fix this")
@@ -439,6 +452,11 @@ class GCEState(MachineState, ResourceState):
             self.automatic_restart = defn.automatic_restart
             self.on_host_maintenance = defn.on_host_maintenance
 
+        # Update instance type
+        if self.instance_type != defn.instance_type:
+            self.connect().ex_set_machine_type(self.node(), defn.instance_type)
+            self.instance_type = defn.instance_type
+
         # Update service account
         if self.email != defn.email or self.scopes != defn.scopes:
             self.log('updating the service account')
@@ -451,11 +469,22 @@ class GCEState(MachineState, ResourceState):
             self.email = defn.email
             self.scopes = defn.scopes
 
+        if self.labels != defn.labels:
+            self.log('updating node labels')
+            node = self.node()
+            labels_request = "/zones/%s/instances/%s" % (node.extra['zone'].name, node.name)
+            response = self.connect().connection.request(labels_request, method='GET').object
+            body = { 'labels': defn.labels, 'labelFingerprint': response['labelFingerprint']}
+            request = '/zones/%s/instances/%s/setLabels' % (node.extra['zone'].name, node.name)
+            self.connect().connection.async_request(request, method='POST', data=body)
+            self.labels = defn.labels
+
         # Attach missing volumes
         for k, v in self.block_device_mapping.items():
             defn_v = defn.block_device_mapping.get(k, None)
             if v.get('needsAttach', False) and defn_v:
-                disk_name = v['disk_name'] or v['disk']
+                disk_name = v['disk_name']
+                disk_volume = v['disk_name'] if v['disk'] is None else v['disk']
                 disk_region = v.get('region', None)
                 v['readOnly'] = defn_v['readOnly']
                 v['bootDisk'] = defn_v['bootDisk']
@@ -463,7 +492,7 @@ class GCEState(MachineState, ResourceState):
                 v['passphrase'] = defn_v['passphrase']
                 self.log("attaching GCE disk '{0}'...".format(disk_name))
                 if not v.get('bootDisk', False):
-                    self.connect().attach_volume(self.node(), self.connect().ex_get_volume(disk_name, disk_region), 
+                    self.connect().attach_volume(self.node(), self.connect().ex_get_volume(disk_volume, disk_region),
                                    device = disk_name,
                                    ex_mode = ('READ_ONLY' if v['readOnly'] else 'READ_WRITE'))
                 del v['needsAttach']
@@ -602,6 +631,10 @@ class GCEState(MachineState, ResourceState):
     def destroy(self, wipe=False):
         if wipe:
             self.depl.logger.warn("wipe is not supported")
+
+        if not self.project:
+            return True
+
         try:
             node = self.node()
             question = "are you sure you want to destroy {0}?"
@@ -619,7 +652,7 @@ class GCEState(MachineState, ResourceState):
         # Destroy volumes created for this instance.
         for k, v in self.block_device_mapping.items():
             if v.get('deleteOnTermination', False):
-                self._delete_volume(v['disk_name'], v['region'])
+                self._delete_volume(v['disk_name'], v['region'], True)
             self.update_block_device_mapping(k, None)
 
         return True
@@ -701,6 +734,7 @@ class GCEState(MachineState, ResourceState):
         except libcloud.common.google.ResourceNotFoundError:
             res.exists = False
             res.is_up = False
+            self.vm_id = None
             self.state = self.MISSING;
 
     def create_after(self, resources, defn):
@@ -735,7 +769,7 @@ class GCEState(MachineState, ResourceState):
                                     .format(volume.name, self.machine_name)
                 })
 
-            backup[disk_name] = snapshot_name
+            backup[k] = snapshot_name
             _backups[backup_id] = backup
             self.backups = _backups
 
@@ -825,7 +859,18 @@ class GCEState(MachineState, ResourceState):
                 RawValue("<nixpkgs/nixos/modules/virtualisation/google-compute-config.nix>")
             ],
             ('deployment', 'gce', 'blockDeviceMapping'): block_device_mapping,
+            ('environment', 'etc', 'default/instance_configs.cfg', 'text'): '[InstanceSetup]\nset_host_keys = false',
         }
+
+    def get_physical_backup_spec(self, backupid):
+          val = {}
+          if backupid in self.backups:
+              for dev, snap in self.backups[backupid].items():
+                  val[dev] = { 'snapshot': Call(RawValue("pkgs.lib.mkOverride 10"), snap)}
+              val = { ('deployment', 'gce', 'blockDeviceMapping'): val }
+          else:
+              val = RawValue("{{}} /* No backup found for id '{0}' */".format(backupid))
+          return Function("{ config, pkgs, ... }", val)
 
     def get_keys(self):
         keys = MachineState.get_keys(self)

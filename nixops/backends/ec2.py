@@ -20,6 +20,7 @@ import nixops.ec2_utils
 import nixops.known_hosts
 from xml import etree
 import datetime
+import boto3
 
 class EC2InstanceDisappeared(Exception):
     pass
@@ -119,6 +120,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         self._conn = None
         self._conn_vpc = None
         self._conn_route53 = None
+        self._conn_boto3 = None
         self._cached_instance = None
 
 
@@ -252,6 +254,10 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         self._conn = nixops.ec2_utils.connect(self.region, self.access_key_id)
         return self._conn
 
+    def connect_boto3(self):
+        if self._conn_boto3: return self._conn_boto3
+        self._conn_boto3 = nixops.ec2_utils.connect_ec2_boto3(self.region, self.access_key_id)
+        return self._conn_boto3
 
     def connect_vpc(self):
         if self._conn_vpc:
@@ -492,6 +498,8 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 isinstance(r, nixops.resources.ec2_placement_group.EC2PlacementGroupState) or
                 isinstance(r, nixops.resources.ebs_volume.EBSVolumeState) or
                 isinstance(r, nixops.resources.elastic_ip.ElasticIPState) or
+                isinstance(r, nixops.resources.vpc_subnet.VPCSubnetState) or
+                isinstance(r, nixops.resources.vpc_route.VPCRouteState) or
                 isinstance(r, nixops.resources.elastic_file_system.ElasticFileSystemState) or
                 isinstance(r, nixops.resources.elastic_file_system_mount_target.ElasticFileSystemMountTargetState)}
 
@@ -774,6 +782,10 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
 
         self.set_common_state(defn)
 
+        if defn.subnet_id.startswith("res-"):
+            res = self.depl.get_typed_resource(defn.subnet_id[4:].split(".")[0], "vpc-subnet")
+            defn.subnet_id = res._state['subnetId']
+
         # Figure out the access key.
         self.access_key_id = defn.access_key_id or nixops.ec2_utils.get_access_key_id()
         if not self.access_key_id:
@@ -784,8 +796,13 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         if self.region is None:
             self.region = defn.region
         elif self.region != defn.region:
-            self.warn("cannot change region of a running instance")
+            self.warn("cannot change region of a running instance (from ‘{}‘ to ‘{}‘)".format(self.region, defn.region))
+
+        if self.key_pair and self.key_pair != defn.key_pair:
+            raise Exception("cannot change key pair of an existing instance (from ‘{}‘ to ‘{}‘)".format(self.key_pair, defn.key_pair))
+
         self.connect()
+        self.connect_boto3()
 
         # Stop the instance (if allowed) to change instance attributes
         # such as the type.
@@ -827,6 +844,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 self.state = self.STARTING
 
         resize_root = False
+        update_instance_profile = True
 
         # Create the instance.
         if not self.vm_id:
@@ -902,6 +920,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 defn.host_key_type().upper())
 
             instance = self.create_instance(defn, zone, devmap, user_data, ebs_optimized)
+            update_instance_profile = False
 
             with self.depl._db:
                 self.vm_id = instance.id
@@ -912,12 +931,14 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 self.security_groups = defn.security_groups
                 self.placement_group = defn.placement_group
                 self.zone = instance.placement
+                self.instance_profile = defn.instance_profile
                 self.client_token = None
                 self.private_host_key = None
 
             # Cancel spot instance request, it isn't needed after the
             # instance has been provisioned.
             self._cancel_spot_request()
+
 
         # There is a short time window during which EC2 doesn't
         # know the instance ID yet.  So wait until it does.
@@ -930,24 +951,29 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         if not self.virtualization_type:
             self.virtualization_type = self._get_instance().virtualization_type
 
+        instance = self._get_instance()
+
         # Warn about some EC2 options that we cannot update for an existing instance.
         if self.instance_type != defn.instance_type:
-            self.warn("cannot change type of a running instance (use ‘--allow-reboot’)")
+            self.warn("cannot change type of a running instance (from ‘{0}‘ to ‘{1}‘): use ‘--allow-reboot’".format(self.instance_type, defn.instance_type))
         if self.ebs_optimized and self.ebs_optimized != defn.ebs_optimized:
-            self.warn("cannot change ebs optimized attribute of a running instance (use ‘--allow-reboot’)")
+            self.warn("cannot change ebs optimized attribute of a running instance: use ‘--allow-reboot’")
         if defn.zone and self.zone != defn.zone:
-            self.warn("cannot change availability zone of a running instance")
-        if set(defn.security_groups) != set(self.security_groups):
+            self.warn("cannot change availability zone of a running (from ‘{0}‘ to ‘{1}‘)".format(self.zone, defn.zone))
+        if not defn.subnet_id and not instance.subnet_id and set(defn.security_groups) != set(self.security_groups):
             self.warn(
                 'cannot change security groups of an existing instance (from [{0}] to [{1}])'.format(
                     ", ".join(set(self.security_groups)),
                     ", ".join(set(defn.security_groups)))
             )
-        instance = self._get_instance()
 
         instance_groups = [g.id for g in instance.groups]
-        new_instance_groups = self.security_groups_to_ids(defn.subnet_id, defn.security_group_ids)
-        if defn.subnet_id and instance.vpc_id and set(instance_groups) != set(new_instance_groups):
+        if defn.subnet_id:
+            new_instance_groups = self.security_groups_to_ids(defn.subnet_id, defn.security_group_ids)
+        elif instance.vpc_id:
+            new_instance_groups = self.security_groups_to_ids(instance.subnet_id, defn.security_groups)
+
+        if instance.vpc_id and set(instance_groups) != set(new_instance_groups):
             self.log("updating security groups from {0} to {1}...".format(instance_groups, new_instance_groups))
             instance.modify_attribute("groupSet", new_instance_groups)
 
@@ -957,6 +983,26 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                     self.placement_group or "",
                     defn.placement_group)
             )
+
+        # update iam instance profiles of instance
+        if update_instance_profile and (self.instance_profile != defn.instance_profile or check):
+            assocs = self._conn_boto3.describe_iam_instance_profile_associations(Filters=[{ 'Name': 'instance-id', 'Values': [self.vm_id]}])['IamInstanceProfileAssociations']
+            if len(assocs) > 0 and self.instance_profile != assocs[0]['IamInstanceProfile']['Arn']:
+                self.log("disassociating instance profile {}".format(assocs[0]['IamInstanceProfile']['Arn']))
+                self._conn_boto3.disassociate_iam_instance_profile(AssociationId=assocs[0]['AssociationId'])
+                nixops.util.check_wait(lambda: len(self._conn_boto3.describe_iam_instance_profile_associations(Filters=[{ 'Name': 'instance-id', 'Values': [self.vm_id]}])['IamInstanceProfileAssociations']) == 0 )
+
+
+            if defn.instance_profile != "":
+                if defn.instance_profile.startswith('arn:'):
+                    iip = { 'Arn': defn.instance_profile }
+                else:
+                    iip = { 'Name': defn.instance_profile }
+                self.log("associating instance profile {}".format(defn.instance_profile))
+                self._retry(lambda: self._conn_boto3.associate_iam_instance_profile(IamInstanceProfile=iip, InstanceId=self.vm_id))
+
+            with self.depl._db:
+                self.instance_profile = defn.instance_profile
 
         # Reapply tags if they have changed.
         common_tags = defn.tags
@@ -1127,6 +1173,8 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
                 v['generatedKey'] = nixops.util.generate_random_string(length=256)
                 self.update_block_device_mapping(k, v)
 
+    def _retry_route53(self, f, error_codes=[]):
+        return nixops.ec2_utils.retry(f, error_codes = ['Throttling', 'PriorRequestNotComplete']+error_codes, logger=self)
 
     def _update_route53(self, defn):
         import boto.route53
@@ -1144,7 +1192,7 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         self.connect_route53()
 
         hosted_zone = ".".join(self.dns_hostname.split(".")[1:])
-        zones = self._conn_route53.get_all_hosted_zones()
+        zones = self._retry_route53(lambda: self._conn_route53.get_all_hosted_zones())
 
         def testzone(hosted_zone, zone):
             """returns True if there is a subcomponent match"""
@@ -1163,20 +1211,20 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
         dns_name = '{0}.'.format(self.dns_hostname)
 
         prev_a_rrs = [prev for prev
-                      in self._conn_route53.get_all_rrsets(
+                      in self._retry_route53(lambda: self._conn_route53.get_all_rrsets(
                           hosted_zone_id=zoneid,
                           type="A",
                           name=dns_name
-                      )
+                      ))
                       if prev.name == dns_name
                       and prev.type == "A"]
 
         prev_cname_rrs = [prev for prev
-                          in self._conn_route53.get_all_rrsets(
+                          in self._retry_route53(lambda: self._conn_route53.get_all_rrsets(
                               hosted_zone_id=zoneid,
                               type="CNAME",
                               name=self.dns_hostname
-                          )
+                          ))
                           if prev.name == dns_name
                           and prev.type == "CNAME"]
 
@@ -1192,22 +1240,9 @@ class EC2State(MachineState, nixops.resources.ec2_common.EC2CommonState):
 
         change = changes.add_change("CREATE", self.dns_hostname, record_type, ttl=self.dns_ttl)
         change.add_value(dns_value)
-        self._commit_route53_changes(changes)
-
-
-    def _commit_route53_changes(self, changes):
-        """Commit changes, but retry PriorRequestNotComplete errors."""
-        retry = 3
-        while True:
-            try:
-                retry -= 1
-                return changes.commit()
-            except boto.route53.exception.DNSServerError, e:
-                code = e.body.split("<Code>")[1]
-                code = code.split("</Code>")[0]
-                if code != 'PriorRequestNotComplete' or retry < 0:
-                    raise e
-                time.sleep(1)
+        # add InvalidChangeBatch to error codes to retry on. Unfortunately AWS sometimes returns
+        # this due to eventual consistency
+        self._retry_route53(lambda: changes.commit(), error_codes=['InvalidChangeBatch'])
 
 
     def _delete_volume(self, volume_id, allow_keep=False):

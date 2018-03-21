@@ -96,10 +96,32 @@ rec {
   resources.ebsVolumes = evalResources ./ebs-volume.nix (zipAttrs resourcesByType.ebsVolumes or []);
   resources.elasticIPs = evalResources ./elastic-ip.nix (zipAttrs resourcesByType.elasticIPs or []);
   resources.rdsDbInstances = evalResources ./ec2-rds-dbinstance.nix (zipAttrs resourcesByType.rdsDbInstances or []);
+  resources.rdsDbSecurityGroups = evalResources ./ec2-rds-dbsecurity-group.nix (zipAttrs resourcesByType.rdsDbSecurityGroups or []);
+  resources.route53RecordSets = evalResources ./route53-recordset.nix (zipAttrs resourcesByType.route53RecordSets or []);
   resources.elasticFileSystems = evalResources ./elastic-file-system.nix (zipAttrs resourcesByType.elasticFileSystems or []);
   resources.elasticFileSystemMountTargets = evalResources ./elastic-file-system-mount-target.nix (zipAttrs resourcesByType.elasticFileSystemMountTargets or []);
   resources.cloudwatchLogGroups = evalResources ./cloudwatch-log-group.nix (zipAttrs resourcesByType.cloudwatchLogGroups or []);
   resources.cloudwatchLogStreams = evalResources ./cloudwatch-log-stream.nix (zipAttrs resourcesByType.cloudwatchLogStreams or []);
+  resources.cloudwatchMetricAlarms = evalResources ./cloudwatch-metric-alarm.nix (zipAttrs resourcesByType.cloudwatchMetricAlarms or []);
+  resources.route53HostedZones = evalResources ./route53-hosted-zone.nix (zipAttrs resourcesByType.route53HostedZones or []);
+  resources.route53HealthChecks = evalResources ./route53-health-check.nix (zipAttrs resourcesByType.route53HealthChecks or []);
+  resources.vpc = evalResources ./vpc.nix (zipAttrs resourcesByType.vpc or []);
+  resources.vpcSubnets = evalResources ./vpc-subnet.nix (zipAttrs resourcesByType.vpcSubnets or []);
+  resources.vpcInternetGateways = evalResources ./vpc-internet-gateway.nix (zipAttrs resourcesByType.vpcInternetGateways or []);
+  resources.vpcEgressOnlyInternetGateways = evalResources ./vpc-egress-only-internet-gateway.nix (zipAttrs resourcesByType.vpcEgressOnlyInternetGateways or []);
+  resources.vpcDhcpOptions = evalResources ./vpc-dhcp-options.nix (zipAttrs resourcesByType.vpcDhcpOptions or []);
+  resources.vpcNetworkAcls = evalResources ./vpc-network-acl.nix (zipAttrs resourcesByType.vpcNetworkAcls or []);
+  resources.vpcNatGateways = evalResources ./vpc-nat-gateway.nix (zipAttrs resourcesByType.vpcNatGateways or []);
+  resources.vpcNetworkInterfaces = evalResources ./vpc-network-interface.nix (zipAttrs resourcesByType.vpcNetworkInterfaces or []);
+  resources.vpcNetworkInterfaceAttachments = evalResources ./vpc-network-interface-attachment.nix (zipAttrs resourcesByType.vpcNetworkInterfaceAttachments or []);
+  resources.vpcRouteTables = evalResources ./vpc-route-table.nix (zipAttrs resourcesByType.vpcRouteTables or []);
+  resources.vpcRouteTableAssociations = evalResources ./vpc-route-table-association.nix (zipAttrs resourcesByType.vpcRouteTableAssociations or []);
+  resources.vpcRoutes = evalResources ./vpc-route.nix (zipAttrs resourcesByType.vpcRoutes or []);
+  resources.vpcCustomerGateways = evalResources ./vpc-customer-gateway.nix (zipAttrs resourcesByType.vpcCustomerGateways or []);
+  resources.vpcEndpoints = evalResources ./vpc-endpoint.nix (zipAttrs resourcesByType.vpcEndpoints or []);
+  resources.awsVPNGateways = evalResources ./aws-vpn-gateway.nix (zipAttrs resourcesByType.awsVPNGateways or []);
+  resources.awsVPNConnections = evalResources ./aws-vpn-connection.nix (zipAttrs resourcesByType.awsVPNConnections or []);
+  resources.awsVPNConnectionRoutes = evalResources ./aws-vpn-connection-route.nix (zipAttrs resourcesByType.awsVPNConnectionRoutes or []);
   resources.machines = mapAttrs (n: v: v.config) nodes;
 
   # Datadog resources
@@ -175,7 +197,7 @@ rec {
   azure_default_group = flip mapAttrs' azure_deployments (name: depl:
     let azure = (scrubOptionValue depl).config.deployment.azure; in (
       nameValuePair ("def-group") [ {
-        inherit (azure) subscriptionId authority user servicePrincipal password location;
+        inherit (azure) subscriptionId authority location identifierUri appId appKey;
       }]
     )
   );
@@ -186,7 +208,7 @@ rec {
   azure_default_networks = mapAttrs' (name: depl:
     let azure = (scrubOptionValue depl).config.deployment.azure; in (
       nameValuePair ("dn-${normalize_location azure.location}") [({ resources, ...}: {
-        inherit (azure) subscriptionId authority user servicePrincipal password location;
+        inherit (azure) subscriptionId authority location identifierUri appId appKey;
         resourceGroup = resources.azureResourceGroups.def-group;
         addressSpace = [ "10.1.0.0/16" ];
       })]
@@ -196,7 +218,7 @@ rec {
   azure_default_storages = mapAttrs' (name: depl:
     let azure = (scrubOptionValue depl).config.deployment.azure; in (
       nameValuePair ("def-storage-${normalize_location azure.location}") [({ resources, ...}: {
-        inherit (azure) subscriptionId authority user servicePrincipal password location;
+        inherit (azure) subscriptionId authority location identifireUri appId appKey;
         resourceGroup = resources.azureResourceGroups.def-group;
         name = "${builtins.substring 0 12 (builtins.replaceStrings ["-"] [""] uuid)}${normalize_location azure.location}";
       })]
@@ -281,7 +303,7 @@ rec {
     machines =
       flip mapAttrs nodes (n: v': let v = scrubOptionValue v'; in
         { inherit (v.config.deployment) targetEnv targetPort targetHost encryptedLinksTo storeKeysOnMachine alwaysActivate owners keys hasFastConnection;
-          nixosRelease = v.config.system.nixosRelease or (removeSuffix v.config.system.nixosVersionSuffix v.config.system.nixosVersion);
+          nixosRelease = v.config.system.nixos.release or v.config.system.nixosRelease or (removeSuffix v.config.system.nixosVersionSuffix v.config.system.nixosVersion);
           azure = optionalAttrs (v.config.deployment.targetEnv == "azure")  v.config.deployment.azure;
           ec2 = optionalAttrs (v.config.deployment.targetEnv == "ec2") v.config.deployment.ec2;
           digitalOcean = optionalAttrs (v.config.deployment.targetEnv == "digitalOcean") v.config.deployment.digitalOcean;

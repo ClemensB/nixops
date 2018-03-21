@@ -233,6 +233,8 @@ in
         '';
       };
 
+      labels = (import ./common-gce-options.nix { inherit lib; }).labels;
+
       metadata = mkOption {
         default = {};
         example = { loglevel = "warn"; };
@@ -261,6 +263,14 @@ in
         description = ''
           The GCE Network to make the instance a part of. Can be either
           a gceNetworks resource or a name of a network not managed by NixOps.
+        '';
+      };
+
+      subnet = mkOption {
+        default = null;
+        type = with types; nullOr str;
+        description =  ''
+          Specifies the subnet that the instances will be part of.
         '';
       };
 

@@ -1,11 +1,10 @@
 { nixopsSrc ? { outPath = ./.; revCount = 0; shortRev = "abcdef"; rev = "HEAD"; }
 , officialRelease ? false
+, nixpkgs ? <nixpkgs>
 }:
 
 let
-
-  pkgs = import <nixpkgs> { };
-
+  pkgs = import nixpkgs { };
   version = "1.6" + (if officialRelease then "" else "pre${toString nixopsSrc.revCount}_${nixopsSrc.shortRev}");
 
 in
@@ -33,11 +32,11 @@ rec {
     distPhase =
       ''
         # Generate the manual and the man page.
-        cp ${import ./doc/manual { revision = nixopsSrc.rev; }} doc/manual/machine-options.xml
+        cp ${import ./doc/manual { revision = nixopsSrc.rev; inherit nixpkgs; }} doc/manual/machine-options.xml
 
         # IMPORTANT: when adding a file here, also populate doc/manual/manual.xml
         ${pkgs.lib.concatMapStrings (fn: ''
-          cp ${import ./doc/manual/resource.nix { revision = nixopsSrc.rev; module = ./nix + ("/" + fn + ".nix"); }} doc/manual/${fn}-options.xml
+          cp ${import ./doc/manual/resource.nix { revision = nixopsSrc.rev; module = ./nix + ("/" + fn + ".nix"); inherit nixpkgs; }} doc/manual/${fn}-options.xml
         '') [ "ebs-volume" "sns-topic" "sqs-queue" "ec2-keypair" "s3-bucket" "iam-role" "ssh-keypair" "ec2-security-group" "elastic-ip"
               "cloudwatch-log-group" "cloudwatch-log-stream"
               "gce-disk" "gce-image" "gce-forwarding-rule" "gce-http-health-check" "gce-network"
@@ -69,7 +68,7 @@ rec {
   };
 
   build = pkgs.lib.genAttrs [ "x86_64-linux" "i686-linux" "x86_64-darwin" ] (system:
-    with import <nixpkgs> { inherit system; };
+    with import nixpkgs { inherit system; };
 
     python2Packages.buildPythonPackage rec {
       name = "nixops-${version}";
@@ -85,6 +84,7 @@ rec {
           boto3
           hetzner
           libcloud
+          libvirt
           azure-storage
           azure-mgmt-compute
           azure-mgmt-network
@@ -110,6 +110,10 @@ rec {
       # Needed by libcloud during tests
       SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 
+      # Add openssh to nixops' PATH. On some platforms, e.g. CentOS and RHEL
+      # the version of openssh is causing errors when have big networks (40+)
+      makeWrapperArgs = ["--prefix" "PATH" ":" "${openssl}/bin" "--set" "PYTHONPATH" ":"];
+
       postInstall =
         ''
           # Backward compatibility symlink.
@@ -120,11 +124,7 @@ rec {
 
           mkdir -p $out/share/nix/nixops
           cp -av nix/* $out/share/nix/nixops
-
-          # Add openssh to nixops' PATH. On some platforms, e.g. CentOS and RHEL
-          # the version of openssh is causing errors when have big networks (40+)
-          wrapProgram $out/bin/nixops --prefix PATH : "${openssh}/bin"
-        ''; # */
+        '';
 
       meta.description = "Nix package for ${stdenv.system}";
     });

@@ -49,6 +49,12 @@ class Deployment(object):
     description = nixops.util.attr_property("description", default_description)
     configs_path = nixops.util.attr_property("configsPath", None)
     rollback_enabled = nixops.util.attr_property("rollbackEnabled", False)
+    datadog_notify = nixops.util.attr_property("datadogNotify", False, bool)
+    datadog_event_info = nixops.util.attr_property("datadogEventInfo", "")
+    datadog_tags = nixops.util.attr_property("datadogTags", [], 'json')
+
+    # internal variable to mark if network attribute of network has been evaluated (separately)
+    network_attr_eval = False
 
     def __init__(self, statefile, uuid, log_file=sys.stderr):
         self._statefile = statefile
@@ -302,12 +308,7 @@ class Deployment(object):
         except subprocess.CalledProcessError:
             raise NixEvalError
 
-
-    def evaluate(self):
-        """Evaluate the Nix expressions belonging to this deployment into a deployment specification."""
-
-        self.definitions = {}
-
+    def evaluate_config(self, attr):
         try:
             # FIXME: use --json
             xml = subprocess.check_output(
@@ -316,7 +317,7 @@ class Deployment(object):
                 + self._eval_flags(self.nix_exprs) +
                 ["--eval-only", "--xml", "--strict",
                  "--arg", "checkConfigurationOptions", "false",
-                 "-A", "info"], stderr=self.logger.log_file)
+                 "-A", attr], stderr=self.logger.log_file)
             if debug: print >> sys.stderr, "XML output of nix-instantiate:\n" + xml
         except OSError as e:
             raise Exception("unable to run ‘nix-instantiate’: {0}".format(e))
@@ -329,10 +330,28 @@ class Deployment(object):
         # in fact the same as what json.loads() on the output of
         # "nix-instantiate --json" would yield.
         config = nixops.util.xml_expr_to_python(tree.find("*"))
+        return (tree, config)
 
-        # Extract global deployment attributes.
-        self.description = config["network"].get("description", self.default_description)
-        self.rollback_enabled = config["network"].get("enableRollback", False)
+    def evaluate_network(self):
+        if not self.network_attr_eval:
+            # Extract global deployment attributes.
+            (_, config) = self.evaluate_config("info.network")
+            self.description = config.get("description", self.default_description)
+            self.rollback_enabled = config.get("enableRollback", False)
+            self.datadog_notify = config.get("datadogNotify", False)
+            self.datadog_event_info = config.get("datadogEventInfo", "")
+            self.datadog_tags = config.get("datadogTags", [])
+            self.datadog_downtime = config.get("datadogDowntime", False)
+            self.datadog_downtime_seconds = config.get("datadogDowntimeSeconds", 3600)
+            self.network_attr_eval = True
+
+    def evaluate(self):
+        """Evaluate the Nix expressions belonging to this deployment into a deployment specification."""
+
+        self.definitions = {}
+        self.evaluate_network()
+
+        (tree, config) = self.evaluate_config("info")
 
         # Extract machine information.
         for x in tree.findall("attrs/attr[@name='machines']/attrs/attr"):
@@ -350,7 +369,7 @@ class Deployment(object):
                 self.definitions[name] = defn
 
 
-    def evaluate_option_value(self, machine_name, option_name, xml=False, include_physical=False):
+    def evaluate_option_value(self, machine_name, option_name, json=False, xml=False, include_physical=False):
         """Evaluate a single option of a single machine in the deployment specification."""
 
         exprs = self.nix_exprs
@@ -368,6 +387,7 @@ class Deployment(object):
                 ["--eval-only", "--strict",
                  "--arg", "checkConfigurationOptions", "false",
                  "-A", "nodes.{0}.config.{1}".format(machine_name, option_name)]
+                + (["--json"] if json else [])
                 + (["--xml"] if xml else []),
                 stderr=self.logger.log_file)
         except subprocess.CalledProcessError:
@@ -478,15 +498,21 @@ class Deployment(object):
                 })
 
             # Set system.stateVersion if the Nixpkgs version supports it.
-            if nixops.util.parse_nixos_version(defn.config["nixosRelease"]) >= ["15", "09"]:
+            nixos_version = nixops.util.parse_nixos_version(defn.config["nixosRelease"])
+            if nixos_version >= ["15", "09"]:
                 attrs_list.append({
                     ('system', 'stateVersion'): Call(RawValue("lib.mkDefault"), m.state_version or defn.config["nixosRelease"])
                 })
 
             if self.nixos_version_suffix:
-                attrs_list.append({
-                    ('system', 'nixosVersionSuffix'): self.nixos_version_suffix
-                })
+                if nixos_version >= [ "18", "03" ]:
+                    attrs_list.append({
+                        ('system', 'nixos', 'versionSuffix'): self.nixos_version_suffix
+                    })
+                else:
+                    attrs_list.append({
+                        ('system', 'nixosVersionSuffix'): self.nixos_version_suffix
+                    })
 
         for m in active_machines.itervalues():
             do_machine(m)
@@ -658,7 +684,7 @@ class Deployment(object):
 
 
     def activate_configs(self, configs_path, include, exclude, allow_reboot,
-                         force_reboot, check, sync, always_activate, dry_activate):
+                         force_reboot, check, sync, always_activate, dry_activate, max_concurrent_activate):
         """Activate the new configuration on a machine."""
 
         def worker(m):
@@ -730,7 +756,7 @@ class Deployment(object):
                 return m.name
             return None
 
-        res = nixops.parallel.run_tasks(nr_workers=-1, tasks=self.active.itervalues(), worker_fun=worker)
+        res = nixops.parallel.run_tasks(nr_workers=max_concurrent_activate, tasks=self.active.itervalues(), worker_fun=worker)
         failed = [x for x in res if x != None]
         if failed != []:
             raise Exception("activation of {0} of {1} machines failed (namely on {2})"
@@ -864,16 +890,14 @@ class Deployment(object):
             self._destroy_resources(include=to_destroy)
 
 
-    def _deploy(self, dry_run=False, build_only=False, create_only=False, copy_only=False, evaluate_only=False,
+    def _deploy(self, dry_run=False, plan_only=False, build_only=False, create_only=False, copy_only=False,
                 include=[], exclude=[], check=False, kill_obsolete=False,
                 allow_reboot=False, allow_recreate=False, force_reboot=False,
-                max_concurrent_copy=5, sync=True, always_activate=False, repair=False, dry_activate=False):
+                max_concurrent_copy=5, max_concurrent_activate=-1, sync=True,
+                always_activate=False, repair=False, dry_activate=False):
         """Perform the deployment defined by the deployment specification."""
 
         self.evaluate_active(include, exclude, kill_obsolete)
-
-        if evaluate_only:
-            return
 
         # Assign each resource an index if it doesn't have one.
         for r in self.active_resources.itervalues():
@@ -899,6 +923,19 @@ class Deployment(object):
                                     .format(r.name, r.get_type(), defn.get_type()))
                 r._created_event = threading.Event()
                 r._errored = False
+
+
+            def plan_worker(r):
+                if not should_do(r, include, exclude): return
+                if hasattr(r, 'plan'):
+                    r.plan(self.definitions[r.name])
+                else:
+                    r.warn("resource type {} doesn't implement a plan operation".format(r.get_type()))
+
+            if plan_only:
+                for r in self.active_resources.itervalues():
+                    plan_worker(r)
+                return
 
             def worker(r):
                 try:
@@ -949,15 +986,11 @@ class Deployment(object):
         if create_only: return
 
         # Build the machine configurations.
-        if dry_run:
-            self.build_configs(dry_run=dry_run, repair=repair, include=include, exclude=exclude)
-            return
-
         # Record configs_path in the state so that the ‘info’ command
         # can show whether machines have an outdated configuration.
-        self.configs_path = self.build_configs(repair=repair, include=include, exclude=exclude)
+        self.configs_path = self.build_configs(dry_run=dry_run, repair=repair, include=include, exclude=exclude)
 
-        if build_only: return
+        if build_only or dry_run: return
 
         # Copy the closures of the machine configurations to the
         # target machines.
@@ -970,7 +1003,8 @@ class Deployment(object):
         self.activate_configs(self.configs_path, include=include,
                               exclude=exclude, allow_reboot=allow_reboot,
                               force_reboot=force_reboot, check=check,
-                              sync=sync, always_activate=always_activate, dry_activate=dry_activate)
+                              sync=sync, always_activate=always_activate,
+                              dry_activate=dry_activate, max_concurrent_activate=max_concurrent_activate)
 
         if dry_activate: return
 
@@ -985,14 +1019,41 @@ class Deployment(object):
         nixops.parallel.run_tasks(nr_workers=-1, tasks=self.active_resources.itervalues(), worker_fun=cleanup_worker)
         self.logger.log(ansi_success("{0}> deployment finished successfully".format(self.name or "unnamed"), outfile=self.logger._log_file))
 
+
+    # can generalize notifications later (e.g. emails, for now just hardcode datadog)
+    def notify_start(self, action):
+        self.evaluate_network()
+        nixops.datadog_utils.create_event(self, title='nixops {} started'.format(action), text=self.datadog_event_info, tags=self.datadog_tags)
+        nixops.datadog_utils.create_downtime(self)
+
+    def notify_success(self, action):
+        nixops.datadog_utils.create_event(self, title='nixops {} succeeded'.format(action), text=self.datadog_event_info, tags=self.datadog_tags)
+        nixops.datadog_utils.delete_downtime(self)
+
+    def notify_failed(self, action, e):
+        nixops.datadog_utils.create_event(self, title='nixops {} failed'.format(action), text="Error: {}\n\n{}".format(e.message, self.datadog_event_info), tags=self.datadog_tags)
+        nixops.datadog_utils.delete_downtime(self)
+
+    def run_with_notify(self, action, f):
+        self.notify_start(action)
+        try:
+            f()
+            self.notify_success(action)
+        except KeyboardInterrupt as e:
+            self.notify_failed(action, e)
+            raise
+        except Exception as e:
+            self.notify_failed(action, e)
+            raise
+
     def deploy(self, **kwargs):
         with self._get_deployment_lock():
-            self._deploy(**kwargs)
+            self.run_with_notify('deploy', lambda: self._deploy(**kwargs))
 
 
     def _rollback(self, generation, include=[], exclude=[], check=False,
                   allow_reboot=False, force_reboot=False,
-                  max_concurrent_copy=5, sync=True):
+                  max_concurrent_copy=5, max_concurrent_activate=-1, sync=True):
         if not self.rollback_enabled:
             raise Exception("rollback is not enabled for this network; please set ‘network.enableRollback’ to ‘true’ and redeploy"
                             )
@@ -1026,7 +1087,8 @@ class Deployment(object):
         self.activate_configs(self.configs_path, include=include,
                               exclude=exclude, allow_reboot=allow_reboot,
                               force_reboot=force_reboot, check=check,
-                              sync=sync, always_activate=True, dry_activate=False)
+                              sync=sync, always_activate=True,
+                              dry_activate=False, max_concurrent_activate=max_concurrent_activate)
 
 
     def rollback(self, **kwargs):
@@ -1070,7 +1132,7 @@ class Deployment(object):
         """Destroy all active and obsolete resources."""
 
         with self._get_deployment_lock():
-            self._destroy_resources(include, exclude, wipe)
+            self.run_with_notify('destroy', lambda: self._destroy_resources(include, exclude, wipe))
 
         # Remove the destroyed machines from the rollback profile.
         # This way, a subsequent "nix-env --delete-generations old" or
